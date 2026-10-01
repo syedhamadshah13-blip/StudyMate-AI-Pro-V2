@@ -1,0 +1,12 @@
+streamlit
+PyMuPDF
+langchain-text-splitters
+langchain-google-genai
+langchain-community
+chromadb
+sentence-transformers
+google-genai
+moviepy
+python-dotenv
+python-docx
+python-pptx

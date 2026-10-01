@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+temp_*
+chroma/
+.DS_Store
+app_hackathon_stable_backup.py
+app_after_codex_hardening_backup.py
+.streamlit/config_hackathon_stable_backup.toml
