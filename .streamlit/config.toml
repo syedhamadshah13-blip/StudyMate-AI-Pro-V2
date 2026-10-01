@@ -1,0 +1,12 @@
+[theme]
+primaryColor = "#3B82F6"
+backgroundColor = "#F6F9FF"
+secondaryBackgroundColor = "#F8FBFF"
+textColor = "#10224A"
+font = "sans serif"
+
+[server]
+maxUploadSize = 200
+# Avoid Streamlit's module watcher probing optional Transformers vision modules
+# during a live demo. Restart Streamlit manually after source changes.
+fileWatcherType = "none"
