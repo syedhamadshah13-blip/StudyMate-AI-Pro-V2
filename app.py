@@ -7,6 +7,7 @@ import time
 import ast
 import html
 import json
+import logging
 import re
 import textwrap
 import zipfile
@@ -29,6 +30,7 @@ api_key = os.getenv("GEMINI_API_KEY")
 # key has been configured. Calls that need Gemini are already protected by the
 # existing safe wrappers/event-level fallbacks below.
 client = genai.Client(api_key=api_key) if api_key else None
+logger = logging.getLogger("studymate")
 
 st.set_page_config(
     page_title="StudyMate AI Pro V2 - Multi-Agent Learning System", 
@@ -117,6 +119,7 @@ st.markdown("""
     .sidebar-info-card span, .sidebar-status-card span { color:var(--muted); font-size:0.7rem; }
     .status-row { display:flex; gap:8px; align-items:center; color:var(--muted); font-size:0.75rem; padding:3px 0; }
     .status-dot { width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 0 3px rgba(16,185,129,.10); flex:none; }
+    .status-dot.warning { background:var(--orange); box-shadow:0 0 0 3px rgba(245,158,11,.12); }
 
     /* Top bar and dashboard surfaces */
     .topbar {
@@ -185,7 +188,7 @@ st.markdown("""
     .stage-blue { --stage-bg:#F2F8FF; --stage-line:#CFE5FF; --stage:#3B82F6; } .stage-violet { --stage-bg:#F8F3FF; --stage-line:#E5D6FF; --stage:#8B5CF6; } .stage-pink { --stage-bg:#FFF4FA; --stage-line:#FFD4E8; --stage:#EC4899; } .stage-green { --stage-bg:#F1FCF7; --stage-line:#C7F1DF; --stage:#10B981; } .stage-gold { --stage-bg:#FFF9E9; --stage-line:#FBE3A6; --stage:#F59E0B; }
     .stage-number { display:inline-grid; place-items:center; width:26px; height:26px; background:var(--stage); color:#fff; border-radius:50%; font-size:.7rem; font-weight:900; box-shadow:0 4px 10px color-mix(in srgb, var(--stage) 30%, transparent); }
     .stage-icon { color:var(--stage); font-size:1.15rem; font-weight:900; margin:.55rem 0 .32rem; } .stage-title { color:var(--ink); font-size:.77rem; font-weight:900; line-height:1.15; } .stage-copy { color:var(--muted); font-size:.65rem; line-height:1.3; min-height:34px; margin:.34rem 0; }
-    .stage-status { display:inline-flex; gap:4px; align-items:center; border-radius:999px; padding:3px 6px; font-size:.59rem; font-weight:900; letter-spacing:.02em; background:#FFF8DE; color:#9A6700; } .stage-status.complete { background:#E9FBF3; color:#078556; } .stage-duration { color:#7A8CAC; font-size:.62rem; float:right; margin-top:3px; }
+    .stage-status { display:inline-flex; gap:4px; align-items:center; border-radius:999px; padding:3px 6px; font-size:.59rem; font-weight:900; letter-spacing:.02em; background:#FFF8DE; color:#9A6700; } .stage-status.complete { background:#E9FBF3; color:#078556; } .stage-status.running { background:#EAF3FF; color:#2563EB; animation:stagePulse 1.4s ease-in-out infinite; } .stage-status.failed { background:#FFF1F2; color:#BE123C; } .stage-duration { color:#7A8CAC; font-size:.62rem; float:right; margin-top:3px; } @keyframes stagePulse { 50% { opacity:.58; } }
     .materials-list, .source-list { display:grid; gap:7px; } .material-row, .source-row { display:flex; gap:9px; align-items:flex-start; padding:8px; border:1px solid #E6EEF9; border-radius:11px; background:#FBFDFF; }
     .file-icon { flex:none; width:27px; height:27px; display:grid; place-items:center; border-radius:8px; color:#fff; background:linear-gradient(135deg,var(--blue),var(--violet)); font-size:.62rem; font-weight:900; } .file-icon.pdf { background:linear-gradient(135deg,#FB7185,#E11D48); } .file-icon.docx { background:linear-gradient(135deg,#60A5FA,#2563EB); } .file-icon.pptx { background:linear-gradient(135deg,#FB923C,#EA580C); }
     .material-name, .source-name { color:var(--ink); font-size:.73rem; font-weight:850; overflow-wrap:anywhere; } .material-copy, .source-copy { color:var(--muted); font-size:.65rem; line-height:1.3; margin-top:2px; }
@@ -327,7 +330,18 @@ def get_vector_store():
     return Chroma(embedding_function=embeddings)
 
 if "vector_store" not in st.session_state:
-    st.session_state.vector_store = get_vector_store()
+    try:
+        st.session_state.vector_store = get_vector_store()
+        st.session_state.vector_store_error = None
+    except Exception as error:
+        # Keep the application usable when a local embedding/Chroma dependency is
+        # unavailable. Avoid logging raw startup details here because the safe
+        # error formatter is defined later in the module.
+        logger.error("Vector store initialization failed: %s", type(error).__name__)
+        st.session_state.vector_store = None
+        st.session_state.vector_store_error = "Vector store unavailable"
+elif "vector_store_error" not in st.session_state:
+    st.session_state.vector_store_error = None
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = set()
 if "messages" not in st.session_state:
@@ -360,6 +374,8 @@ if "agent_retrieved_sources" not in st.session_state:
     st.session_state.agent_retrieved_sources = []
 if "agent_audit_log" not in st.session_state:
     st.session_state.agent_audit_log = []
+if "workflow_stage_states" not in st.session_state:
+    st.session_state.workflow_stage_states = {}
 if "adaptive_revision_output" not in st.session_state:
     st.session_state.adaptive_revision_output = None
 if "architect_mermaid_output" not in st.session_state:
@@ -382,6 +398,23 @@ if st.session_state.nav_override:
     st.session_state.nav_page = st.session_state.nav_override
     st.session_state.nav_override = None
 
+# Reset widgets on the rerun after the Reset button is pressed, before those
+# widgets are created again. This avoids Streamlit's post-instantiation state
+# mutation error and prevents a previous topic's inputs from reappearing.
+if st.session_state.pop("workflow_reset_widget_values", False):
+    for widget_key in (
+        "multi_agent_study_topic",
+        "multi_agent_difficulty",
+        "multi_agent_audience",
+        "adaptive_score",
+        "adaptive_missed_questions",
+        "challenger_question_number",
+        "challenger_answer_choice",
+        "challenger_reasoning",
+        "challenger_defense",
+    ):
+        st.session_state.pop(widget_key, None)
+
 # Keep the menu radio in sync with navigation buttons such as Home and Make Exam.
 if st.session_state.get("popover_nav_radio") != st.session_state.nav_page:
     st.session_state.popover_nav_radio = st.session_state.nav_page
@@ -389,31 +422,85 @@ if st.session_state.get("popover_nav_radio") != st.session_state.nav_page:
 def navigate_from_menu():
     st.session_state.nav_page = st.session_state.popover_nav_radio
 
-# --- BULLETPROOF API WRAPPERS WITH SMART MOCK FALLBACK ---
+
+def vector_store_ready():
+    """Return whether this session can safely index or retrieve material."""
+    return st.session_state.get("vector_store") is not None
+
+
+def rag_status_label():
+    if vector_store_ready():
+        return "RAG Ready"
+    if st.session_state.get("vector_store_error"):
+        return "RAG Unavailable"
+    return "RAG Initializing"
+
+
+# --- API WRAPPERS WITH RETRY AND USER-SAFE ERROR REPORTING ---
+def _safe_error_detail(error):
+    """Keep useful server diagnostics without ever recording the configured API key."""
+    detail = f"{type(error).__name__}: {error}"
+    return detail.replace(api_key, "[REDACTED]") if api_key else detail
+
+
+def _log_runtime_error(area, error):
+    logger.error("%s failed: %s", area, _safe_error_detail(error))
+
+
 def safe_generate_content(contents, prompt):
     try:
         res = client.models.generate_content(model='gemini-3.6-flash', contents=[contents, prompt])
         return res.text
     except Exception as e:
-        return "[Automated Fallback Note]: Media processed successfully. Key topics identified: Core concepts, definitions, and structural breakdowns from your uploaded study module."
+        _log_runtime_error("Gemini media generation", e)
+        raise RuntimeError("Gemini could not process the media request.") from e
 
-def safe_llm_invoke(llm, prompt):
+
+def create_gemini_llm():
+    """Use one bounded Gemini configuration for every text-generation feature."""
+    return ChatGoogleGenerativeAI(
+        model="gemini-3.6-flash",
+        google_api_key=api_key,
+        # The wrapper below owns the user-visible retry. Disable the SDK's much
+        # longer implicit retry loop so quota errors do not leave the demo busy.
+        retries=0,
+        request_timeout=25,
+    )
+
+
+def is_rate_limited_error(error):
+    error_text = str(error).lower()
+    return "resource_exhausted" in error_text or "rate limit" in error_text or "429" in error_text
+
+
+def safe_llm_invoke(llm, prompt, *, raise_on_failure=False):
     formatted_prompt = f"""{prompt}
 
 Format the response as clean GitHub-flavored Markdown. For mathematical expressions,
 wrap valid LaTex in $...$ so equations render correctly."""
 
     # A short retry protects multi-step workflows from transient Gemini request
-    # failures before the established offline fallback is used.
-    for attempt in range(2):
-        try:
-            res = llm.invoke(formatted_prompt)
-            return extract_llm_text(res.content if hasattr(res, 'content') else res)
-        except Exception:
-            if llm is not None and attempt == 0:
-                time.sleep(2)
-                continue
-            break
+    # failures before the caller presents a clear, feature-specific result.
+    last_error = None
+    if llm is not None:
+        for attempt in range(2):
+            try:
+                res = llm.invoke(formatted_prompt)
+                return extract_llm_text(res.content if hasattr(res, 'content') else res)
+            except Exception as error:
+                last_error = error
+                if attempt == 0 and not is_rate_limited_error(error):
+                    time.sleep(2)
+                    continue
+                break
+
+    if raise_on_failure:
+        if last_error is not None:
+            _log_runtime_error("Gemini language-model request", last_error)
+            raise RuntimeError("Gemini could not complete the request after retrying.") from last_error
+        unavailable_error = RuntimeError("Gemini language model is not configured.")
+        _log_runtime_error("Gemini language-model request", unavailable_error)
+        raise unavailable_error
 
     if "PRINTABLE EXAM PAPER" in prompt:
         return """# StudyMate AI Pro — Practice Examination
@@ -466,7 +553,9 @@ wrap valid LaTex in $...$ so equations render correctly."""
 # --- LIGHT DASHBOARD PRESENTATION HELPERS ---
 
 HOME_ROUTE = "🏠 Study Workspace & Chat"
+STUDY_WORKSPACE_ROUTE = "📚 Study Workspace"
 AUTO_AGENT_ROUTE = "🤖 Auto-Agent Workflow"
+VOICE_TUTOR_ROUTE = "🎙️ Voice Tutor"
 
 
 def _safe_html(value):
@@ -491,6 +580,9 @@ def _last_agent_event(stage):
 
 
 def _stage_status(stage, completed_when=False):
+    state = st.session_state.get("workflow_stage_states", {}).get(stage)
+    if state:
+        return state.get("status", "READY"), state.get("duration_seconds")
     event = _last_agent_event(stage)
     if event:
         return event.get("status", "COMPLETE"), event.get("duration_seconds")
@@ -501,8 +593,7 @@ def _stage_status(stage, completed_when=False):
 
 def render_topbar():
     gemini_label = "Gemini Connected" if api_key else "Gemini Not Configured"
-    rag_ready = "vector_store" in st.session_state and st.session_state.vector_store is not None
-    rag_label = "RAG Ready" if rag_ready else "RAG Initializing"
+    rag_label = rag_status_label()
     st.markdown(
         f"""
         <div class="topbar">
@@ -530,20 +621,27 @@ def _navigate_to(page):
 
 
 def render_sidebar():
+    rag_ready = vector_store_ready()
+    status_dot_class = "" if rag_ready else " warning"
+    gemini_dot_class = "" if api_key else " warning"
+    chroma_label = "ChromaDB Ready" if rag_ready else "ChromaDB Unavailable"
+    pipeline_label = "RAG Pipeline Active" if rag_ready else "RAG Pipeline Unavailable"
     navigation_items = [
         ("Home", ":material/home:", HOME_ROUTE, True),
-        ("Study Workspace", ":material/school:", HOME_ROUTE, False),
+        ("Study Workspace", ":material/school:", STUDY_WORKSPACE_ROUTE, True),
         ("Auto-Agent Workflow", ":material/account_tree:", AUTO_AGENT_ROUTE, True),
         ("AI Capabilities", ":material/auto_awesome:", "⚡ System Capabilities", True),
         ("Exam Generator", ":material/quiz:", "📝 AI Exam Generator", True),
         ("RAG Architecture", ":material/database:", "🧠 RAG Architecture & Flow", True),
         ("File Processing", ":material/folder_open:", "📁 File Processing Status", True),
-        ("Voice Tutor", ":material/mic:", AUTO_AGENT_ROUTE, False),
+        ("Voice Tutor", ":material/mic:", VOICE_TUTOR_ROUTE, True),
         ("Environment & Security", ":material/shield:", "🔐 Environment & Security", True),
     ]
     canonical_active_labels = {
         HOME_ROUTE: "Home",
+        STUDY_WORKSPACE_ROUTE: "Study Workspace",
         AUTO_AGENT_ROUTE: "Auto-Agent Workflow",
+        VOICE_TUTOR_ROUTE: "Voice Tutor",
         "⚡ System Capabilities": "AI Capabilities",
         "📝 AI Exam Generator": "Exam Generator",
         "🧠 RAG Architecture & Flow": "RAG Architecture",
@@ -584,9 +682,9 @@ def render_sidebar():
               <strong>System Status</strong>
             """
             + f"""
-              <div class="status-row"><span class="status-dot"></span>{_safe_html('Gemini Connected' if api_key else 'Gemini Not Configured')}</div>
-              <div class="status-row"><span class="status-dot"></span>ChromaDB Ready</div>
-              <div class="status-row"><span class="status-dot"></span>RAG Pipeline Active</div>
+              <div class="status-row"><span class="status-dot{gemini_dot_class}"></span>{_safe_html('Gemini Connected' if api_key else 'Gemini Not Configured')}</div>
+              <div class="status-row"><span class="status-dot{status_dot_class}"></span>{_safe_html(chroma_label)}</div>
+              <div class="status-row"><span class="status-dot{status_dot_class}"></span>{_safe_html(pipeline_label)}</div>
               <div class="status-row"><span class="status-dot"></span>4 AI Agent Roles</div>
             </div>
             """,
@@ -596,8 +694,7 @@ def render_sidebar():
 
 def render_dashboard_hero():
     gemini_label = "Gemini Connected" if api_key else "Gemini Not Configured"
-    rag_ready = "vector_store" in st.session_state and st.session_state.vector_store is not None
-    rag_label = "RAG Ready" if rag_ready else "RAG Initializing"
+    rag_label = rag_status_label()
     st.markdown(
         f"""
         <section class="hero-banner">
@@ -618,29 +715,39 @@ def render_dashboard_hero():
     )
 
 
-def render_workflow_pipeline():
+def set_workflow_stage(stage, status, duration_seconds=None):
+    """Record the live state of a visual-only workflow stage."""
+    entry = {"status": str(status).upper()}
+    if duration_seconds is not None:
+        entry["duration_seconds"] = round(float(duration_seconds), 2)
+    st.session_state.workflow_stage_states[stage] = entry
+
+
+def render_workflow_pipeline(target=None):
     stage_specs = [
         ("RAG Grounding", "RAG Grounding", "RAG", "Retrieve relevant context from active materials.", "stage-blue", False),
         ("Architect Agent", "Architect Agent", "AI", "Design the learning plan and concept sequence.", "stage-violet", False),
         ("Examiner Agent", "Examiner Agent", "QZ", "Generate syllabus-bounded assessment items.", "stage-pink", False),
-        ("Python Structure Pre-Check", "Structure Pre-Check", "PY", "Validate question structure before QA.", "stage-blue", bool(st.session_state.get("agent_qa_output"))),
+        ("Python Structure Pre-Check", "Structure Pre-Check", "PY", "Validate question structure before QA.", "stage-blue", False),
         ("QA Critic Agent", "QA Critic Agent", "QA", "Review, correct and validate the module.", "stage-green", False),
-        ("Business Workflow", "Certified Module", "OK", "Publish the validated learning artifact.", "stage-gold", bool(st.session_state.get("agent_qa_output"))),
+        ("Business Workflow", "Certified Module", "OK", "Publish the validated learning artifact.", "stage-gold", False),
     ]
     stage_html = []
     for number, (event_name, label, icon, description, class_name, inferred_complete) in enumerate(stage_specs, start=1):
         status, duration = _stage_status(event_name, completed_when=inferred_complete)
         status = str(status).upper()
-        complete_class = "complete" if status in {"COMPLETE", "COMPLETED", "PASSED", "VALIDATED"} else ""
+        complete_class = "complete" if status in {"COMPLETE", "COMPLETED", "PASSED", "VALIDATED"} else "running" if status == "RUNNING" else "failed" if status in {"FAILED", "BLOCKED"} else ""
         duration_text = f"{duration}s" if duration is not None else ""
         stage_html.append(
             f'<div class="workflow-stage {class_name}"><span class="stage-number">{number}</span><div class="stage-icon">{icon}</div><div class="stage-title">{_safe_html(label)}</div><div class="stage-copy">{_safe_html(description)}</div><span class="stage-status {complete_class}">{_safe_html(status)}</span><span class="stage-duration">{_safe_html(duration_text)}</span></div>'
         )
-    run_label = "Latest execution" if st.session_state.get("agent_audit_log") else "Ready to run"
-    st.markdown(
+    stage_states = st.session_state.get("workflow_stage_states", {})
+    run_label = "Live execution" if any(item.get("status") == "RUNNING" for item in stage_states.values()) else "Latest execution" if st.session_state.get("agent_audit_log") else "Ready to run"
+    output_target = st if target is None else target
+    output_target.markdown(
         """
         <div class="panel-heading">
-          <div><div class="panel-title">Autonomous Learning Engine <span class="mini-chip">Multi-Agent Workflow</span></div><div class="panel-copy">Four specialized AI agents collaborate to build, validate and adapt your learning experience.</div></div>
+          <div><div class="panel-title">Autonomous Learning Engine <span class="mini-chip">Multi-Agent Workflow</span></div><div class="panel-copy">Status cards update from the primary launch action as real agent work completes.</div></div>
           <div class="live-label"><span class="status-dot"></span>"""
         + _safe_html(run_label)
         + """</div>
@@ -648,6 +755,25 @@ def render_workflow_pipeline():
         + "".join(stage_html)
         + "</div>",
         unsafe_allow_html=True,
+    )
+
+
+def fail_workflow_stage(stage, error, pipeline_slot):
+    """Show a safe failure state without converting a failed agent call into a certified artifact."""
+    _log_runtime_error(f"Autonomous workflow ({stage})", error)
+    detail = f"{type(error).__name__} recorded in the server log"
+    set_workflow_stage(stage, "FAILED")
+    log_agent_event(stage, "FAILED", detail)
+    if stage != "Business Workflow":
+        set_workflow_stage("Business Workflow", "BLOCKED")
+        log_agent_event(
+            "Business Workflow",
+            "BLOCKED",
+            f"Stopped because {stage} did not complete."
+        )
+    render_workflow_pipeline(pipeline_slot)
+    st.error(
+        f"The autonomous workflow stopped at {stage}. Please retry after resolving the recorded service or retrieval error."
     )
 
 
@@ -975,12 +1101,50 @@ Respond with:
 Do not expose hidden reasoning or invent content outside the supplied context.
 """
         return safe_generate_content(media_ref, prompt)
-    except Exception:
+    except Exception as error:
+        _log_runtime_error("Voice Tutor", error)
         return 'I could not process the voice question right now. Please retry or use the text-based study tools.'
     finally:
         if os.path.exists(temp_path):
             try: os.remove(temp_path)
             except Exception: pass
+
+
+def render_voice_tutor(learning_context):
+    """Render the single shared Voice Tutor UI for its sidebar and workflow locations."""
+    st.markdown("<div id='voice-tutor'></div>", unsafe_allow_html=True)
+    st.markdown("### Voice Tutor")
+    st.caption(
+        "Ask by voice. Gemini answers from the certified study context, then browser Text-to-Speech reads the response aloud."
+    )
+    voice_question_audio = st.audio_input(
+        "Ask the tutor a question",
+        key="voice_tutor_audio_input",
+    )
+    has_learning_context = bool(learning_context)
+    if not has_learning_context:
+        st.info(
+            "Voice Tutor uses the Certified Learning Module as its context. Run the Autonomous Workflow first, then return here."
+        )
+    if voice_question_audio is not None:
+        if st.button(
+            "🎧 Analyze Voice Question",
+            use_container_width=True,
+            key="analyze_voice_tutor_question",
+            disabled=not has_learning_context,
+        ):
+            with st.spinner("Listening and preparing a Socratic response..."):
+                st.session_state.voice_tutor_output = answer_voice_tutor(
+                    voice_question_audio.getvalue(), learning_context
+                )
+            log_agent_event(
+                "Voice Socratic Tutor", "COMPLETED",
+                "Voice question processed and tutor response created"
+            )
+    if st.session_state.voice_tutor_output:
+        st.markdown("#### 🤖 Spoken Tutor Response")
+        st.markdown(st.session_state.voice_tutor_output)
+        render_tts_controls(st.session_state.voice_tutor_output, "🔊 Speak Tutor Response")
 
 def extract_document_chunks(file_bytes, extension):
     """Extract PDF/TXT/DOCX/PPTX text correctly, then chunk it for ChromaDB."""
@@ -996,14 +1160,25 @@ def extract_document_chunks(file_bytes, extension):
 
     elif extension == "docx":
         doc = Document(io.BytesIO(file_bytes))
-        text_value = "\n".join(p.text for p in doc.paragraphs)
+        text_parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    text_parts.append(" | ".join(cells))
+        text_value = "\n".join(text_parts)
 
     elif extension == "pptx":
         presentation = Presentation(io.BytesIO(file_bytes))
         slide_text = []
         for slide in presentation.slides:
             for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
+                if getattr(shape, "has_table", False):
+                    for row in shape.table.rows:
+                        cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                        if cells:
+                            slide_text.append(" | ".join(cells))
+                elif hasattr(shape, "text") and shape.text:
                     slide_text.append(shape.text)
         text_value = "\n".join(slide_text)
 
@@ -1020,12 +1195,34 @@ def extract_document_chunks(file_bytes, extension):
     ).split_text(text_value)
 
 
-def retrieve_agent_context(query, k=5):
+def refresh_retriever(k=3):
+    """Refresh the session retriever after new chunks reach the active vector store."""
+    try:
+        vector_store = st.session_state.get("vector_store")
+        if vector_store is None:
+            raise RuntimeError("The local vector store is unavailable.")
+        st.session_state.retriever = vector_store.as_retriever(
+            search_kwargs={"k": k}
+        )
+        return True
+    except Exception as error:
+        _log_runtime_error("ChromaDB retriever initialization", error)
+        st.session_state.pop("retriever", None)
+        return False
+
+
+def retrieve_agent_context(query, k=5, *, raise_on_error=False):
     """Retrieve grounded context and source metadata from the existing ChromaDB."""
     docs = []
     try:
-        docs = st.session_state.vector_store.similarity_search(query, k=k)
-    except Exception:
+        vector_store = st.session_state.get("vector_store")
+        if vector_store is None:
+            raise RuntimeError("The local vector store is unavailable.")
+        docs = vector_store.similarity_search(query, k=k)
+    except Exception as error:
+        _log_runtime_error("ChromaDB retrieval", error)
+        if raise_on_error:
+            raise RuntimeError("ChromaDB retrieval failed.") from error
         docs = []
 
     context_parts = []
@@ -1077,11 +1274,14 @@ def reset_agent_workflow():
     st.session_state.agent_qa_output = None
     st.session_state.agent_retrieved_sources = []
     st.session_state.agent_audit_log = []
+    st.session_state.workflow_stage_states = {}
     st.session_state.adaptive_revision_output = None
     st.session_state.architect_mermaid_output = None
     st.session_state.challenger_output = None
     st.session_state.challenger_feedback = None
     st.session_state.voice_tutor_output = None
+    st.session_state.last_exam_output = None
+    st.session_state.last_exam_is_paper = False
 
 
 
@@ -1114,17 +1314,24 @@ def extract_media_chunks(media_file_bytes, file_extension):
             if os.path.exists(f): os.remove(f)
         return RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(transcript_text)
     except Exception as e:
+        _log_runtime_error("Audio/video processing", e)
         for f in [temp_raw, temp_optimized]: 
             if os.path.exists(f): os.remove(f)
-        return RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text("Fallback lecture notes: Core concepts covered in uploaded audio/video recording.")
+        raise RuntimeError("Audio/video transcription could not be completed.") from e
 
 # --- MODERN MODAL FOR UPLOAD STUDY FILES ---
 @st.dialog("📤 Upload Study Files & Neural Database")
 def upload_study_files_modal():
+    store_ready = vector_store_ready()
+    retriever_ready = "retriever" in st.session_state
+    store_label = "● Active" if store_ready else "● Unavailable"
+    retriever_label = "● Ready" if retriever_ready else "● Available after indexing"
+    store_color = "#34D399" if store_ready else "#F59E0B"
+    retriever_color = "#38BDF8" if retriever_ready else "#F59E0B"
     st.markdown(f"""
         <div style="font-size: 0.85rem; color: #64759A; margin-bottom: 12px;">
-            Vector Store: <b style="color:#34D399;">● Active</b><br>
-            Retriever: <b style="color:#38BDF8;">● Ready</b><br>
+            Vector Store: <b style="color:{store_color};">{store_label}</b><br>
+            Retriever: <b style="color:{retriever_color};">{retriever_label}</b><br>
             Loaded Modules: <b>{len(st.session_state.processed_files)}</b>
         </div>
     """, unsafe_allow_html=True)
@@ -1141,10 +1348,15 @@ def upload_study_files_modal():
         "Upload study files", 
         type=['pdf', 'mp3', 'wav', 'mp4', 'mov', 'avi', 'txt', 'docx', 'pptx'],
         accept_multiple_files=True,
-        key="modal_file_uploader_widget"
+        key="modal_file_uploader_widget",
+        disabled=not store_ready,
     )
-    
-    if modal_upload:
+
+    if not store_ready:
+        st.error("The local vector store is unavailable, so files cannot be indexed yet. Check the embedding/Chroma setup, then retry.")
+
+    if modal_upload and store_ready:
+        indexed_this_upload = False
         for f in modal_upload:
             if f.name in st.session_state.processed_files:
                 st.info(f"ℹ️ '{f.name}' is already cached in the Neural Database.")
@@ -1156,7 +1368,7 @@ def upload_study_files_modal():
                     ext = f.name.split('.')[-1].lower()
                     try:
                         with st.spinner(f"⚡ Processing {f.name}..."):
-                            file_bytes = f.read()
+                            file_bytes = f.getvalue()
                             chunks = extract_document_chunks(file_bytes, ext) if ext in ['pdf', 'txt', 'docx', 'pptx'] else extract_media_chunks(file_bytes, ext)
                             for i in range(0, len(chunks), 15): 
                                 batch = chunks[i:i + 15]
@@ -1179,14 +1391,27 @@ def upload_study_files_modal():
                                     st.success(f"👁️ Vision analyzed {len(visual_insights)} useful visual(s) from {f.name}.")
 
                             st.session_state.processed_files.add(f.name)
-                    except Exception:
+                            indexed_this_upload = True
+                    except Exception as error:
+                        _log_runtime_error(f"File indexing ({f.name})", error)
                         st.error(
                             f"⚠️ {f.name} could not be read and was not added to the "
                             "Neural Database. Please try a supported, non-corrupt file."
                         )
+        if indexed_this_upload:
+            # An exam is tied to the material available when it was generated;
+            # avoid displaying that stale artifact after new source material arrives.
+            st.session_state.last_exam_output = None
+            st.session_state.last_exam_is_paper = False
+
         if st.session_state.processed_files:
-            st.session_state['retriever'] = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
-            st.success(f"✅ {len(st.session_state.processed_files)} modules active in Neural Database!")
+            if refresh_retriever():
+                if indexed_this_upload:
+                    st.success(f"✅ Indexed and activated {len(st.session_state.processed_files)} module(s) in Neural Database!")
+                else:
+                    st.success(f"✅ {len(st.session_state.processed_files)} modules active in Neural Database!")
+            else:
+                st.warning("Files were indexed, but the retriever could not be refreshed. Please retry before asking questions or generating an exam.")
 
     st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
     if st.button("Close / Done", use_container_width=True, key="close_modal_btn"):
@@ -1202,7 +1427,7 @@ nav_page = st.session_state.nav_page
 
 # --- PAGE ROUTING ---
 
-if nav_page == "🏠 Study Workspace & Chat":
+if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
     render_dashboard_hero()
 
     # --- THREE FUNCTIONAL QUICK ACTION CARDS ---
@@ -1247,7 +1472,9 @@ if nav_page == "🏠 Study Workspace & Chat":
                 use_container_width=True,
                 key="home_ask_ai",
             ):
-                st.session_state.pending_query = "What core concepts can you summarize from my notes?"
+                # Open the actual workspace instead of submitting a canned query.
+                # That leaves the learner in control of the grounded question.
+                _navigate_to(STUDY_WORKSPACE_ROUTE)
                 st.rerun()
     with f3:
         with st.container(border=True, key="quick_agents_card"):
@@ -1284,49 +1511,61 @@ if nav_page == "🏠 Study Workspace & Chat":
         lecture_audio = st.audio_input("Record live lecture audio")
         if lecture_audio is not None:
             st.audio(lecture_audio)
-            if st.button("🚀 Index Lecture Audio into Database"):
-                with st.spinner("⚡ Transcribing and indexing lecture audio..."):
-                    try:
-                        audio_bytes = lecture_audio.read()
+            if st.button("🚀 Index Lecture Audio into Database", key="index_lecture_audio"):
+                if not vector_store_ready():
+                    st.error("The local vector store is unavailable, so lecture audio cannot be indexed yet.")
+                else:
+                    with st.spinner("⚡ Transcribing and indexing lecture audio..."):
                         temp_lecture_path = "temp_lecture.wav"
-                        with open(temp_lecture_path, "wb") as f:
-                            f.write(audio_bytes)
-                        
-                        media_ref = client.files.upload(file=temp_lecture_path)
-                        transcript_text = safe_generate_content(media_ref, "Thoroughly transcribe this lecture into clean, structured study notes.")
-                        if os.path.exists(temp_lecture_path):
-                            os.remove(temp_lecture_path)
-                            
-                        chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(transcript_text)
-                        for i in range(0, len(chunks), 15):
-                            batch = chunks[i:i + 15]
-                            # NEW: Attach metadata for live audio notes
-                            metadatas = [{"source": "Live Audio Lecture"} for _ in batch]
-                            st.session_state.vector_store.add_texts(batch, metadatas=metadatas)
-                        
-                        lecture_title = f"Lecture_Audio_Note_{int(time.time())}"
-                        st.session_state.processed_files.add(lecture_title)
-                        st.session_state['retriever'] = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
-                        
-                        st.success(f"✅ Lecture successfully transcribed and added to your Neural Database!")
-                        st.session_state.show_audio_recorder = False
-                        st.rerun()
-                    except Exception as ex:
-                        st.success(f"✅ Lecture successfully added via Neural Cache!")
-                        st.session_state.show_audio_recorder = False
-                        st.rerun()
+                        try:
+                            audio_bytes = lecture_audio.getvalue()
+                            with open(temp_lecture_path, "wb") as f:
+                                f.write(audio_bytes)
+
+                            media_ref = client.files.upload(file=temp_lecture_path)
+                            transcript_text = safe_generate_content(media_ref, "Thoroughly transcribe this lecture into clean, structured study notes.")
+                            chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(transcript_text)
+                            for i in range(0, len(chunks), 15):
+                                batch = chunks[i:i + 15]
+                                metadatas = [{"source": "Live Audio Lecture"} for _ in batch]
+                                st.session_state.vector_store.add_texts(batch, metadatas=metadatas)
+
+                            lecture_title = f"Lecture_Audio_Note_{int(time.time())}"
+                            st.session_state.processed_files.add(lecture_title)
+                            if refresh_retriever():
+                                st.success("✅ Lecture successfully transcribed and added to your Neural Database!")
+                                st.session_state.show_audio_recorder = False
+                                st.rerun()
+                            else:
+                                raise RuntimeError("The lecture was indexed but the retriever could not be refreshed.")
+                        except Exception as ex:
+                            _log_runtime_error("Lecture audio indexing", ex)
+                            st.error("The lecture audio could not be indexed. Please retry; the technical details were recorded in the server log.")
+                        finally:
+                            if os.path.exists(temp_lecture_path):
+                                try:
+                                    os.remove(temp_lecture_path)
+                                except OSError:
+                                    pass
+
+    database_ready = vector_store_ready()
+    database_label = "Neural Database Active" if database_ready else "Neural Database Unavailable"
+    database_state = "● Online" if database_ready else "● Unavailable"
+    database_color = "#34D399" if database_ready else "#F59E0B"
+    retriever_label = "Ready" if "retriever" in st.session_state else "Awaiting indexed material"
+    vector_label = "ChromaDB" if database_ready else "Unavailable"
 
     st.markdown(f"""
         <div class="glass-card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <b style="font-size:0.95rem; color:#38BDF8;">Neural Database Active</b>
-                <span style="color:#34D399; font-size:0.75rem;">● Online</span>
+                <b style="font-size:0.95rem; color:#38BDF8;">{database_label}</b>
+                <span style="color:{database_color}; font-size:0.75rem;">{database_state}</span>
             </div>
             <div class="stats-grid">
                 <div>Indexed: <b style="color:#10224A;">{len(st.session_state.processed_files)}</b></div>
-                <div>Retriever: <b style="color:#34D399;">Ready</b></div>
+                <div>Retriever: <b style="color:#34D399;">{retriever_label}</b></div>
                 <div>Model: <b style="color:#C084FC;">Gemini 3.6 Flash</b></div>
-                <div>Vector: <b style="color:#38BDF8;">ChromaDB</b></div>
+                <div>Vector: <b style="color:#38BDF8;">{vector_label}</b></div>
             </div>
         </div>
     """, unsafe_allow_html=True)
@@ -1336,6 +1575,7 @@ if nav_page == "🏠 Study Workspace & Chat":
         len(st.session_state.processed_files) > 0
         or len(st.session_state.messages) > 0
         or st.session_state.pending_query
+        or nav_page == STUDY_WORKSPACE_ROUTE
     ):
         st.markdown("""
             <div class="glass-card">
@@ -1379,7 +1619,7 @@ if nav_page == "🏠 Study Workspace & Chat":
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        chat_input_val = st.chat_input("Type your study query here...", accept_audio=True, accept_file=True, file_type=['pdf', 'txt', 'mp3', 'wav'])
+        chat_input_val = st.chat_input("Type your study query here...", accept_audio=True)
 
         if st.session_state.pending_query:
             chat_query = st.session_state.pending_query
@@ -1392,31 +1632,29 @@ if nav_page == "🏠 Study Workspace & Chat":
                     try:
                         if 'retriever' in st.session_state:
                             docs = st.session_state['retriever'].invoke(chat_query)
-                            # NEW: Prepending explicit source labels for citations
-                            context = "\n\n".join([f"[Source: {doc.metadata.get('source', 'Uploaded Notes')}]: {doc.page_content}" for doc in docs])
-                            llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
-                            
-                            # NEW: PRD Compliant Socratic Prompt
-                            socratic_prompt = f"""You are an Aspire AI Socratic Tutor.
-                            RULES:
-                            1. Do NOT give the direct answer immediately. Give a hint or guide the student to the next logical step.
-                            2. If the answer cannot be found in the provided context, you MUST reply verbatim: "This context is not available in your provided materials."
-                            3. Always cite your sources using the [Source: ...] labels provided in the context.
-                            
-                            Context Notes:
-                            {context}
-                            
-                            Question: {chat_query}"""
-                            
-                            answer_text = safe_llm_invoke(llm, socratic_prompt)
-                            st.markdown(answer_text)
-                            st.session_state.messages.append({"role": "assistant", "content": answer_text})
+                            if not docs:
+                                st.info("This context is not available in your provided materials.")
+                            else:
+                                context = "\n\n".join([f"[Source: {doc.metadata.get('source', 'Uploaded Notes')}]: {doc.page_content}" for doc in docs])
+                                llm = create_gemini_llm()
+                                socratic_prompt = f"""You are an Aspire AI Socratic Tutor.
+                                RULES:
+                                1. Do NOT give the direct answer immediately. Give a hint or guide the student to the next logical step.
+                                2. If the answer cannot be found in the provided context, you MUST reply verbatim: "This context is not available in your provided materials."
+                                3. Always cite your sources using the [Source: ...] labels provided in the context.
+                                
+                                Context Notes:
+                                {context}
+                                
+                                Question: {chat_query}"""
+                                answer_text = safe_llm_invoke(llm, socratic_prompt, raise_on_failure=True)
+                                st.markdown(answer_text)
+                                st.session_state.messages.append({"role": "assistant", "content": answer_text})
                         else:
                             st.warning("⚠️ Please upload study files using the 📄 Upload Docs button first.")
-                    except Exception as e:
-                        fallback_msg = "Based on your uploaded notes, the primary concepts focus on structured modular design and RAG verification."
-                        st.markdown(fallback_msg)
-                        st.session_state.messages.append({"role": "assistant", "content": fallback_msg})
+                    except Exception as error:
+                        _log_runtime_error("RAG chat", error)
+                        st.error("StudyMate could not answer from the indexed material. Please retry; the technical details were recorded in the server log.")
 
         if chat_input_val:
             if hasattr(chat_input_val, "text") and chat_input_val.text:
@@ -1430,31 +1668,29 @@ if nav_page == "🏠 Study Workspace & Chat":
                         try:
                             if 'retriever' in st.session_state:
                                 docs = st.session_state['retriever'].invoke(user_text)
-                                # NEW: Prepending explicit source labels for citations
-                                context = "\n\n".join([f"[Source: {doc.metadata.get('source', 'Uploaded Notes')}]: {doc.page_content}" for doc in docs])
-                                llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
-                                
-                                # NEW: PRD Compliant Socratic Prompt
-                                socratic_prompt = f"""You are an Aspire AI Socratic Tutor.
-                                RULES:
-                                1. Do NOT give the direct answer immediately. Give a hint or guide the student to the next logical step.
-                                2. If the answer cannot be found in the provided context, you MUST reply verbatim: "This context is not available in your provided materials."
-                                3. Always cite your sources using the [Source: ...] labels provided in the context.
-                                
-                                Context Notes:
-                                {context}
-                                
-                                Question: {user_text}"""
-                                
-                                answer_text = safe_llm_invoke(llm, socratic_prompt)
-                                st.markdown(answer_text)
-                                st.session_state.messages.append({"role": "assistant", "content": answer_text})
+                                if not docs:
+                                    st.info("This context is not available in your provided materials.")
+                                else:
+                                    context = "\n\n".join([f"[Source: {doc.metadata.get('source', 'Uploaded Notes')}]: {doc.page_content}" for doc in docs])
+                                    llm = create_gemini_llm()
+                                    socratic_prompt = f"""You are an Aspire AI Socratic Tutor.
+                                    RULES:
+                                    1. Do NOT give the direct answer immediately. Give a hint or guide the student to the next logical step.
+                                    2. If the answer cannot be found in the provided context, you MUST reply verbatim: "This context is not available in your provided materials."
+                                    3. Always cite your sources using the [Source: ...] labels provided in the context.
+                                    
+                                    Context Notes:
+                                    {context}
+                                    
+                                    Question: {user_text}"""
+                                    answer_text = safe_llm_invoke(llm, socratic_prompt, raise_on_failure=True)
+                                    st.markdown(answer_text)
+                                    st.session_state.messages.append({"role": "assistant", "content": answer_text})
                             else:
                                 st.warning("⚠️ Please upload study files using the 📄 Upload Docs button first.")
-                        except Exception as e:
-                            fallback_msg = "Here is the relevant information based on your active study modules and database retrieval."
-                            st.markdown(fallback_msg)
-                            st.session_state.messages.append({"role": "assistant", "content": fallback_msg})
+                        except Exception as error:
+                            _log_runtime_error("RAG chat", error)
+                            st.error("StudyMate could not answer from the indexed material. Please retry; the technical details were recorded in the server log.")
 
             if hasattr(chat_input_val, "audio") and chat_input_val.audio:
                 audio_file = chat_input_val.audio
@@ -1464,9 +1700,9 @@ if nav_page == "🏠 Study Workspace & Chat":
                 
                 with st.chat_message("assistant", avatar="🤖"):
                     with st.spinner("🎙️ Transcribing and processing voice recording..."):
+                        temp_audio_path = "temp_chat_voice.wav"
                         try:
-                            audio_bytes = audio_file.read()
-                            temp_audio_path = "temp_chat_voice.wav"
+                            audio_bytes = audio_file.getvalue()
                             with open(temp_audio_path, "wb") as af:
                                 af.write(audio_bytes)
                             
@@ -1477,10 +1713,15 @@ if nav_page == "🏠 Study Workspace & Chat":
                                 
                             st.markdown(voice_answer)
                             st.session_state.messages.append({"role": "assistant", "content": voice_answer})
-                        except Exception as ex:
-                            fallback_msg = "🎙️ Voice note successfully processed and indexed into your active study session."
-                            st.markdown(fallback_msg)
-                            st.session_state.messages.append({"role": "assistant", "content": fallback_msg})
+                        except Exception as error:
+                            _log_runtime_error("Chat voice input", error)
+                            st.error("The voice note could not be processed. Please retry or use a text question.")
+                        finally:
+                            if os.path.exists(temp_audio_path):
+                                try:
+                                    os.remove(temp_audio_path)
+                                except OSError:
+                                    pass
     else:
         st.info("💡 Click **'📄 Upload Docs'** above or use **'🎙️ Audio Notes'** to activate your interactive AI workspace.")
 
@@ -1542,7 +1783,7 @@ elif nav_page == "📝 AI Exam Generator":
     
     g1, g2 = st.columns(2)
     with g1:
-        source_opt = st.selectbox("Source", ["Active Notes", "Neural Database"])
+        st.caption("Source: active indexed study material")
         q_count = st.selectbox("Number of Questions", [3, 5, 10, 20])
     with g2:
         diff = st.selectbox("Difficulty", ["Easy", "Medium", "Hard"])
@@ -1564,42 +1805,51 @@ elif nav_page == "📝 AI Exam Generator":
         exam_button_label = "🚀 Generate Professional Exam"
 
     if st.button(exam_button_label):
-        with st.spinner("Compiling academic assessment..."):
-            try:
-                llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key) 
-                docs = st.session_state['retriever'].invoke("Summarize key concepts for exam") if 'retriever' in st.session_state else []
-                context = "\n\n".join([doc.page_content for doc in docs]) if docs else "General academic notes."
+        st.session_state.last_exam_output = None
+        st.session_state.last_exam_is_paper = is_paper_exam
+        if not st.session_state.processed_files:
+            st.warning("Upload and index study material before generating a grounded exam.")
+        elif not api_key:
+            st.error("Gemini is not configured, so a grounded exam cannot be generated yet.")
+        else:
+            with st.spinner("Compiling academic assessment from indexed study material..."):
+                try:
+                    if "retriever" not in st.session_state and not refresh_retriever():
+                        raise RuntimeError("The retriever could not be initialized.")
+                    docs = st.session_state.retriever.invoke("Summarize key concepts for a grounded exam")
+                    if not docs:
+                        st.warning("No relevant indexed material was retrieved. Add or re-index notes before generating an exam.")
+                    else:
+                        context = "\n\n".join(
+                            f"[Source: {doc.metadata.get('source', 'Uploaded Notes')}]\n{doc.page_content}"
+                            for doc in docs
+                        )
 
-                if is_paper_exam:
-                    exam_prompt = f"""Create a PRINTABLE EXAM PAPER from the study notes below.
+                        if is_paper_exam:
+                            exam_prompt = f"""Create a PRINTABLE EXAM PAPER from the study notes below.
 Use {q_count} questions at {diff} difficulty. Include a formal title, blank Student Name,
 Roll Number, Date, Time Allowed, and Total Marks fields. Include clear instructions, numbered
 sections, marks for every question, writing space for short answers, and a separate Answer Key —
 Teacher Copy after a horizontal rule. Use a balanced mix of MCQs and short-answer questions.
 Study notes:
 {context}"""
-                elif is_flashcards:
-                    # NEW: Prompt specific for generating Flashcards
-                    exam_prompt = f"""Generate {q_count} {diff} level study flashcards based on the notes below. 
+                        elif is_flashcards:
+                            exam_prompt = f"""Generate {q_count} {diff} level study flashcards based on the notes below. 
 Format as a clean markdown list with 'Front: [Term/Question]' and 'Back: [Definition/Explanation]'.
 Study notes:
 {context}"""
-                else:
-                    exam_prompt = f"Generate {q_count} {diff} level MCQs with options A, B, C, D, correct answer, and explanation based on:\n{context}"
+                        else:
+                            exam_prompt = f"Generate {q_count} {diff} level MCQs with options A, B, C, D, correct answer, and explanation based on:\n{context}"
 
-                st.session_state.last_exam_output = safe_llm_invoke(llm, exam_prompt)
-                st.session_state.last_exam_is_paper = is_paper_exam
-            except Exception as e:
-                # Fallback logic depending on type
-                if is_paper_exam:
-                    fallback_prompt = "PRINTABLE EXAM PAPER"
-                elif is_flashcards:
-                    fallback_prompt = "Flashcards"
-                else:
-                    fallback_prompt = "Exam"
-                    
-                st.session_state.last_exam_output = safe_llm_invoke(None, fallback_prompt)
-                st.session_state.last_exam_is_paper = is_paper_exam
+                        st.session_state.last_exam_output = safe_llm_invoke(
+                            create_gemini_llm(),
+                            exam_prompt,
+                            raise_on_failure=True,
+                        )
+                except Exception as error:
+                    _log_runtime_error("Exam Generator", error)
+                    st.session_state.last_exam_output = None
+                    st.error("Gemini could not generate the grounded exam. Please retry; the technical details were recorded in the server log.")
 
     if st.session_state.last_exam_output:
         output_title = "🖨️ Printable Exam Paper" if st.session_state.last_exam_is_paper else ("🃏 Study Flashcards" if is_flashcards else "📝 Exam Output")
@@ -1634,7 +1884,8 @@ elif nav_page == "🤖 Auto-Agent Workflow":
     """, unsafe_allow_html=True)
 
     with st.container(border=True, key="agent_pipeline_panel"):
-        render_workflow_pipeline()
+        workflow_pipeline_slot = st.empty()
+        render_workflow_pipeline(workflow_pipeline_slot)
 
     workflow_config_col, workflow_sources_col = st.columns([1.08, 1], gap="medium")
     with workflow_config_col:
@@ -1692,6 +1943,7 @@ elif nav_page == "🤖 Auto-Agent Workflow":
                     key="reset_agent_workflow"
                 ):
                     reset_agent_workflow()
+                    st.session_state.workflow_reset_widget_values = True
                     st.rerun()
     with workflow_sources_col:
         with st.container(border=True, key="retrieved_sources_panel"):
@@ -1866,26 +2118,33 @@ Return ONLY the complete certified module.
     if launch_agents:
         if not study_topic.strip():
             st.error("Please enter a study objective before launching the workflow.")
+        elif not api_key:
+            st.error("Gemini is not configured, so the autonomous workflow cannot start yet.")
         else:
-            st.session_state.agent_audit_log = []
-            st.session_state.adaptive_revision_output = None
+            # A new launch is a new run: never let old artifacts certify this objective.
+            reset_agent_workflow()
+            render_workflow_pipeline(workflow_pipeline_slot)
 
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-3.6-flash",
-                google_api_key=api_key
-            )
+            llm = create_gemini_llm()
 
             workflow_start = time.perf_counter()
 
             # STEP 0: RAG
+            set_workflow_stage("RAG Grounding", "RUNNING")
+            render_workflow_pipeline(workflow_pipeline_slot)
             with st.expander("🔎 Step 0 — RAG Grounding", expanded=True):
                 rag_start = time.perf_counter()
                 st.markdown("**Status:** 🟡 Searching the neural knowledge base...")
 
-                context, retrieved_docs, sources = retrieve_agent_context(
-                    study_topic,
-                    k=retrieval_k
-                )
+                try:
+                    context, retrieved_docs, sources = retrieve_agent_context(
+                        study_topic,
+                        k=retrieval_k,
+                        raise_on_error=True,
+                    )
+                except Exception as error:
+                    fail_workflow_stage("RAG Grounding", error, workflow_pipeline_slot)
+                    st.stop()
                 st.session_state.agent_retrieved_sources = sources
 
                 if retrieved_docs:
@@ -1912,10 +2171,14 @@ Return ONLY the complete certified module.
                     f"{len(retrieved_docs)} chunks retrieved",
                     rag_duration
                 )
+                set_workflow_stage("RAG Grounding", "COMPLETED", rag_duration)
+                render_workflow_pipeline(workflow_pipeline_slot)
 
             time.sleep(1)
 
             # AGENT 1
+            set_workflow_stage("Architect Agent", "RUNNING")
+            render_workflow_pipeline(workflow_pipeline_slot)
             with st.expander("🏗️ Agent 1 — Architect | Curriculum Planning", expanded=True):
                 architect_start = time.perf_counter()
                 st.markdown("**Status:** 🟡 Planning from the grounded context...")
@@ -1936,14 +2199,16 @@ Create the syllabus now.
 """
 
                 with st.spinner("Architect Agent is designing the 3-day curriculum..."):
-                    syllabus_output = safe_llm_invoke(llm, architect_request)
+                    try:
+                        syllabus_output = safe_llm_invoke(
+                            llm, architect_request, raise_on_failure=True
+                        )
+                    except Exception as error:
+                        fail_workflow_stage("Architect Agent", error, workflow_pipeline_slot)
+                        st.stop()
 
                 st.session_state.agent_architect_output = syllabus_output
-
-                if "[Automated Fallback Note]" in str(syllabus_output):
-                    st.warning("The live model call used fallback behavior.")
-                else:
-                    st.success("✅ Architect completed its artifact.")
+                st.success("✅ Architect completed its artifact.")
 
                 st.markdown("#### 📤 Architect Artifact")
                 st.markdown(syllabus_output)
@@ -1973,7 +2238,13 @@ SYLLABUS:
 {syllabus_output}
 """
                 with st.spinner("Architect is building the visual learning map..."):
-                    mermaid_output = safe_llm_invoke(llm, mindmap_prompt)
+                    try:
+                        mermaid_output = safe_llm_invoke(
+                            llm, mindmap_prompt, raise_on_failure=True
+                        )
+                    except Exception as error:
+                        fail_workflow_stage("Architect Agent", error, workflow_pipeline_slot)
+                        st.stop()
                 st.session_state.architect_mermaid_output = extract_mermaid_code(mermaid_output)
                 render_mermaid(st.session_state.architect_mermaid_output)
                 with st.expander("View Mermaid source", expanded=False):
@@ -1983,10 +2254,16 @@ SYLLABUS:
                     "Mermaid learning-path diagram generated",
                     time.perf_counter() - mindmap_start
                 )
+                set_workflow_stage(
+                    "Architect Agent", "COMPLETED", time.perf_counter() - architect_start
+                )
+                render_workflow_pipeline(workflow_pipeline_slot)
 
             time.sleep(1)
 
             # AGENT 2
+            set_workflow_stage("Examiner Agent", "RUNNING")
+            render_workflow_pipeline(workflow_pipeline_slot)
             with st.expander("📝 Agent 2 — Examiner | Assessment Generation", expanded=True):
                 examiner_start = time.perf_counter()
                 st.markdown("**Handoff:** 📥 Exact Architect artifact received automatically.")
@@ -2008,7 +2285,13 @@ Create exactly five MCQs now.
 """
 
                 with st.spinner("Examiner Agent is constructing the assessment..."):
-                    exam_output = safe_llm_invoke(llm, examiner_request)
+                    try:
+                        exam_output = safe_llm_invoke(
+                            llm, examiner_request, raise_on_failure=True
+                        )
+                    except Exception as error:
+                        fail_workflow_stage("Examiner Agent", error, workflow_pipeline_slot)
+                        st.stop()
 
                 st.session_state.agent_examiner_output = exam_output
 
@@ -2023,11 +2306,20 @@ Create exactly five MCQs now.
                     "Five-question assessment artifact produced",
                     examiner_duration
                 )
+                set_workflow_stage("Examiner Agent", "COMPLETED", examiner_duration)
+                render_workflow_pipeline(workflow_pipeline_slot)
 
             time.sleep(1)
 
             # MACHINE PRE-CHECK BEFORE QA
-            precheck_issues = examiner_precheck(exam_output)
+            set_workflow_stage("Python Structure Pre-Check", "RUNNING")
+            render_workflow_pipeline(workflow_pipeline_slot)
+            precheck_start = time.perf_counter()
+            try:
+                precheck_issues = examiner_precheck(exam_output)
+            except Exception as error:
+                fail_workflow_stage("Python Structure Pre-Check", error, workflow_pipeline_slot)
+                st.stop()
 
             with st.expander("⚙️ Automated Structure Pre-Check", expanded=True):
                 if precheck_issues:
@@ -2042,7 +2334,22 @@ Create exactly five MCQs now.
                         "✅ Structure pre-check passed. QA will still perform semantic validation."
                     )
 
+            precheck_duration = time.perf_counter() - precheck_start
+            precheck_status = "PASSED" if not precheck_issues else "COMPLETED"
+            log_agent_event(
+                "Python Structure Pre-Check",
+                precheck_status,
+                "No structural issues detected." if not precheck_issues else f"{len(precheck_issues)} issue(s) handed to QA for correction.",
+                precheck_duration,
+            )
+            set_workflow_stage(
+                "Python Structure Pre-Check", precheck_status, precheck_duration
+            )
+            render_workflow_pipeline(workflow_pipeline_slot)
+
             # AGENT 3
+            set_workflow_stage("QA Critic Agent", "RUNNING")
+            render_workflow_pipeline(workflow_pipeline_slot)
             with st.expander("🛡️ Agent 3 — QA Critic | Reflection & Self-Correction", expanded=True):
                 qa_start = time.perf_counter()
                 st.markdown(
@@ -2089,29 +2396,44 @@ Audit, repair where needed, and return the complete certified module.
 """
 
                 with st.spinner("QA Critic is validating and self-correcting..."):
-                    final_module = safe_llm_invoke(llm, qa_request)
+                    try:
+                        final_module = safe_llm_invoke(
+                            llm, qa_request, raise_on_failure=True
+                        )
+                    except Exception as error:
+                        fail_workflow_stage("QA Critic Agent", error, workflow_pipeline_slot)
+                        st.stop()
 
                 st.session_state.agent_qa_output = final_module
-
-                st.success("✅ QA reflection, correction and certification complete.")
+                module_qa_verified = "Certification Status: APPROVED" in str(final_module)
+                if module_qa_verified:
+                    st.success("✅ QA reflection, correction and certification complete.")
+                else:
+                    st.warning("QA returned a module, but it did not include an explicit approval marker. Review it before treating it as certified.")
                 st.markdown("#### 📤 Certified Artifact")
                 st.markdown(final_module)
 
                 qa_duration = time.perf_counter() - qa_start
+                qa_status = "VALIDATED" if module_qa_verified else "COMPLETED"
                 log_agent_event(
                     "QA Critic Agent",
-                    "COMPLETED",
-                    f"Certification completed; machine issues supplied: {len(precheck_issues)}",
+                    qa_status,
+                    f"QA artifact completed; machine issues supplied: {len(precheck_issues)}",
                     qa_duration
                 )
+                set_workflow_stage("QA Critic Agent", qa_status, qa_duration)
+                render_workflow_pipeline(workflow_pipeline_slot)
 
             total_duration = time.perf_counter() - workflow_start
+            workflow_status = "VALIDATED" if module_qa_verified else "COMPLETED"
             log_agent_event(
                 "Business Workflow",
-                "COMPLETED",
-                "End-to-end autonomous pipeline finished",
+                workflow_status,
+                "End-to-end autonomous pipeline finished" if module_qa_verified else "Module produced without explicit QA approval marker",
                 total_duration
             )
+            set_workflow_stage("Business Workflow", workflow_status, total_duration)
+            render_workflow_pipeline(workflow_pipeline_slot)
 
             st.markdown("---")
             st.success(
@@ -2272,10 +2594,8 @@ Audit, repair where needed, and return the complete certified module.
             use_container_width=True,
             key="generate_adaptive_revision"
         ):
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-3.6-flash",
-                google_api_key=api_key
-            )
+            st.session_state.adaptive_revision_output = None
+            llm = create_gemini_llm()
 
             coach_prompt = f"""
 You are the StudyMate Adaptive Revision Coach.
@@ -2302,10 +2622,15 @@ Do not expose hidden reasoning.
 """
 
             with st.spinner("Creating a focused revision plan..."):
-                st.session_state.adaptive_revision_output = safe_llm_invoke(
-                    llm,
-                    coach_prompt
-                )
+                try:
+                    st.session_state.adaptive_revision_output = safe_llm_invoke(
+                        llm,
+                        coach_prompt,
+                        raise_on_failure=True,
+                    )
+                except Exception as error:
+                    _log_runtime_error("Adaptive Revision Coach", error)
+                    st.error("The revision plan could not be generated right now. Please retry after checking the Gemini connection.")
 
         if st.session_state.adaptive_revision_output:
             st.markdown(st.session_state.adaptive_revision_output)
@@ -2333,7 +2658,9 @@ Do not expose hidden reasoning.
         )
 
         if st.button("⚔️ Challenge My Reasoning", use_container_width=True, key="run_challenger_agent"):
-            llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
+            st.session_state.challenger_output = None
+            st.session_state.challenger_feedback = None
+            llm = create_gemini_llm()
             challenger_start = time.perf_counter()
             challenger_prompt = f"""
 [STUDYMATE_AGENT_CHALLENGER]
@@ -2360,12 +2687,21 @@ OUTPUT:
 Do not provide the final verdict yet.
 """
             with st.spinner("Challenger Agent is pressure-testing your reasoning..."):
-                st.session_state.challenger_output = safe_llm_invoke(llm, challenger_prompt)
-            log_agent_event(
-                "Challenger Agent", "COMPLETED",
-                f"Reasoning challenge generated for question {challenge_question}",
-                time.perf_counter() - challenger_start
-            )
+                try:
+                    st.session_state.challenger_output = safe_llm_invoke(
+                        llm,
+                        challenger_prompt,
+                        raise_on_failure=True,
+                    )
+                except Exception as error:
+                    _log_runtime_error("Challenger Agent", error)
+                    st.error("The Challenger could not respond right now. Please retry after checking the Gemini connection.")
+                else:
+                    log_agent_event(
+                        "Challenger Agent", "COMPLETED",
+                        f"Reasoning challenge generated for question {challenge_question}",
+                        time.perf_counter() - challenger_start
+                    )
 
         if st.session_state.challenger_output:
             st.markdown(st.session_state.challenger_output)
@@ -2376,7 +2712,8 @@ Do not provide the final verdict yet.
                 key="challenger_defense"
             )
             if st.button("✅ Evaluate My Defense", use_container_width=True, key="evaluate_challenger_defense"):
-                llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
+                st.session_state.challenger_feedback = None
+                llm = create_gemini_llm()
                 feedback_prompt = f"""
 You are the StudyMate Challenger evaluator.
 
@@ -2397,7 +2734,15 @@ Give a concise evaluation:
 Do not expose hidden chain-of-thought.
 """
                 with st.spinner("Evaluating your defense..."):
-                    st.session_state.challenger_feedback = safe_llm_invoke(llm, feedback_prompt)
+                    try:
+                        st.session_state.challenger_feedback = safe_llm_invoke(
+                            llm,
+                            feedback_prompt,
+                            raise_on_failure=True,
+                        )
+                    except Exception as error:
+                        _log_runtime_error("Challenger defense evaluation", error)
+                        st.error("The defense evaluation could not be generated right now. Please retry after checking the Gemini connection.")
 
         if st.session_state.challenger_feedback:
             st.markdown(st.session_state.challenger_feedback)
@@ -2405,25 +2750,21 @@ Do not expose hidden chain-of-thought.
         # --------------------------------------------------------
         # VOICE-TO-VOICE SOCRATIC TUTOR
         # --------------------------------------------------------
-        st.markdown("### Voice Tutor")
-        st.caption(
-            "Ask by voice. Gemini answers from the certified study context, then browser Text-to-Speech reads the response aloud."
-        )
-        voice_question_audio = st.audio_input("Ask the tutor a question", key="voice_tutor_audio_input")
-        if voice_question_audio is not None:
-            if st.button("🎧 Analyze Voice Question", use_container_width=True, key="analyze_voice_tutor_question"):
-                with st.spinner("Listening and preparing a Socratic response..."):
-                    st.session_state.voice_tutor_output = answer_voice_tutor(
-                        voice_question_audio.getvalue(), final_module
-                    )
-                log_agent_event(
-                    "Voice Socratic Tutor", "COMPLETED",
-                    "Voice question processed and tutor response created"
-                )
-        if st.session_state.voice_tutor_output:
-            st.markdown("#### 🤖 Spoken Tutor Response")
-            st.markdown(st.session_state.voice_tutor_output)
-            render_tts_controls(st.session_state.voice_tutor_output, "🔊 Speak Tutor Response")
+        render_voice_tutor(final_module)
+
+
+elif nav_page == VOICE_TUTOR_ROUTE:
+    render_voice_tutor(st.session_state.agent_qa_output)
+    if not st.session_state.agent_qa_output:
+        if st.button(
+            "Open Auto-Agent Workflow",
+            icon=":material/account_tree:",
+            type="primary",
+            use_container_width=True,
+            key="voice_tutor_open_workflow",
+        ):
+            _navigate_to(AUTO_AGENT_ROUTE)
+            st.rerun()
 
 
 elif nav_page == "🧠 RAG Architecture & Flow":
@@ -2494,6 +2835,17 @@ elif nav_page == "🧠 RAG Architecture & Flow":
 elif nav_page == "📁 File Processing Status":
     st.markdown("## File & Media Processing Pipelines")
     st.markdown("Maximum file size limit: **200MB**")
+
+    with st.container(border=True, key="file_processing_materials"):
+        render_materials_panel("Active Indexed Materials")
+        if vector_store_ready():
+            retriever_state = "ready" if "retriever" in st.session_state else "awaiting the first successful index"
+            st.caption(
+                f"Active indexed materials: {len(st.session_state.processed_files)}. "
+                f"Retriever status: {retriever_state}."
+            )
+        else:
+            st.error("The local vector store is unavailable, so no indexing status can be confirmed yet.")
     
     st.markdown("""
         <div class="glass-card">
@@ -2540,15 +2892,17 @@ elif nav_page == "🔐 Environment & Security":
 
 else:
     st.warning("Unknown navigation state. Returning to the Study Workspace.")
-    if st.button("Go Home"):
-        st.session_state.nav_page = "🏠 Study Workspace & Chat"
+    if st.button("Go Home", key="unknown_navigation_go_home"):
+        _navigate_to(HOME_ROUTE)
         st.rerun()
 
 # --- SYSTEM FOOTER ---
 st.markdown("---")
-st.markdown("""
+footer_rag_label = "ChromaDB active" if vector_store_ready() else "ChromaDB unavailable"
+footer_gemini_label = "Gemini configured" if api_key else "Gemini not configured"
+st.markdown(f"""
     <div class="footer-bar">
         <div><b>StudyMate AI Pro V2</b> — Autonomous Multi-Agent Learning System</div>
-        <div>System online &nbsp;•&nbsp; Gemini configured &nbsp;•&nbsp; ChromaDB active &nbsp;•&nbsp; 4 agent roles</div>
+        <div>System online &nbsp;•&nbsp; {_safe_html(footer_gemini_label)} &nbsp;•&nbsp; {_safe_html(footer_rag_label)} &nbsp;•&nbsp; 4 agent roles</div>
     </div>
 """, unsafe_allow_html=True)
