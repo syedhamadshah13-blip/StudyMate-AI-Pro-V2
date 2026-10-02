@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import textwrap
+import tempfile
 import zipfile
 from datetime import datetime
 from dotenv import load_dotenv
@@ -20,6 +21,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from google import genai
+from google.genai import types
 from moviepy import VideoFileClip
 from docx import Document
 from pptx import Presentation
@@ -418,6 +420,18 @@ if "challenger_feedback" not in st.session_state:
     st.session_state.challenger_feedback = None
 if "voice_tutor_output" not in st.session_state:
     st.session_state.voice_tutor_output = None
+if "voice_audio_bytes" not in st.session_state:
+    st.session_state.voice_audio_bytes = None
+if "voice_audio_mime" not in st.session_state:
+    st.session_state.voice_audio_mime = None
+if "voice_audio_name" not in st.session_state:
+    st.session_state.voice_audio_name = None
+if "voice_transcript" not in st.session_state:
+    st.session_state.voice_transcript = None
+if "voice_question" not in st.session_state:
+    st.session_state.voice_question = None
+if "certified_module" not in st.session_state:
+    st.session_state.certified_module = st.session_state.agent_qa_output
 if "vision_insights" not in st.session_state:
     st.session_state.vision_insights = []
 
@@ -488,6 +502,176 @@ def safe_generate_content(contents, prompt):
         raise RuntimeError("Gemini could not process the media request.") from e
 
 
+class VoiceAudioInputError(ValueError):
+    """Raised when a browser recording cannot safely be sent to Gemini."""
+
+
+class EmptyVoiceAudioError(VoiceAudioInputError):
+    """Raised when the browser returns a recording without usable bytes."""
+
+
+class UnsupportedVoiceAudioError(VoiceAudioInputError):
+    """Raised for a microphone MIME type Gemini is not asked to guess."""
+
+
+class EmptyVoiceTranscriptError(VoiceAudioInputError):
+    """Raised when Gemini returns no spoken text for a captured recording."""
+
+
+VOICE_TRANSCRIPTION_PROMPT = "Transcribe this audio accurately. Return only the spoken text."
+VOICE_QUOTA_MESSAGE = (
+    "Voice recording was captured successfully, but Gemini is temporarily unavailable "
+    "because the API quota/rate limit was reached. Please retry later or type your question."
+)
+RAG_QUOTA_MESSAGE = (
+    "Your study material was retrieved successfully, but Gemini is temporarily unavailable "
+    "because the API quota/rate limit was reached. Please retry later."
+)
+VOICE_AUDIO_MIME_TYPES = {
+    "audio/wav": "audio/wav",
+    "audio/x-wav": "audio/wav",
+    "audio/webm": "audio/webm",
+    "audio/ogg": "audio/ogg",
+    "audio/mp4": "audio/mp4",
+}
+VOICE_AUDIO_SUFFIXES = {
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".mp4",
+}
+
+
+def _error_chain_text(error):
+    """Include chained provider causes when classifying a user-safe failure."""
+    details = []
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        details.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    return " ".join(details).lower()
+
+
+def _capture_audio_payload(audio_file, source):
+    """Read a Streamlit UploadedFile once and retain its actual supported MIME type."""
+    if audio_file is None:
+        raise EmptyVoiceAudioError("No recording was supplied.")
+
+    audio_bytes = audio_file.getvalue()
+    if not audio_bytes:
+        raise EmptyVoiceAudioError("The recording contains no bytes.")
+
+    raw_mime = str(getattr(audio_file, "type", "") or "").split(";", 1)[0].strip().lower()
+    audio_mime = VOICE_AUDIO_MIME_TYPES.get(raw_mime)
+    if not audio_mime:
+        raise UnsupportedVoiceAudioError(f"Unsupported microphone MIME type: {raw_mime or 'missing'}")
+
+    audio_name = str(getattr(audio_file, "name", "") or "recording")
+    logger.info(
+        "%s captured audio: name=%s mime=%s bytes=%d",
+        source,
+        audio_name,
+        audio_mime,
+        len(audio_bytes),
+    )
+    return audio_bytes, audio_mime, audio_name
+
+
+def _generate_audio_text(audio_bytes, audio_mime, prompt):
+    """Submit short microphone audio inline so Gemini receives the real MIME type."""
+    if client is None:
+        raise RuntimeError("Gemini client is not configured.")
+
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime)
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=[audio_part, prompt],
+    )
+    return str(getattr(response, "text", "") or "").strip()
+
+
+def _generate_uploaded_audio_text(audio_bytes, audio_mime, prompt):
+    """Keep longer lecture indexing on Gemini's file API with its actual MIME type."""
+    if client is None:
+        raise RuntimeError("Gemini client is not configured.")
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="studymate_lecture_",
+            suffix=VOICE_AUDIO_SUFFIXES[audio_mime],
+            delete=False,
+        ) as audio_handle:
+            audio_handle.write(audio_bytes)
+            temp_path = audio_handle.name
+
+        media_ref = client.files.upload(
+            file=temp_path,
+            config=types.UploadFileConfig(mime_type=audio_mime),
+        )
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[media_ref, prompt],
+        )
+        return str(getattr(response, "text", "") or "").strip()
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def transcribe_voice_audio(audio_bytes, audio_mime):
+    """Return a validated transcript before the existing text/RAG flow runs."""
+    transcript = _generate_audio_text(audio_bytes, audio_mime, VOICE_TRANSCRIPTION_PROMPT)
+    if not transcript:
+        raise EmptyVoiceTranscriptError("Gemini returned an empty transcription.")
+    return transcript
+
+
+def is_rate_limited_error(error):
+    error_text = _error_chain_text(error)
+    return (
+        "resource_exhausted" in error_text
+        or "rate limit" in error_text
+        or "quota" in error_text
+        or "429" in error_text
+    )
+
+
+def _voice_error_message(error):
+    """Map diagnostics to clear, non-technical audio guidance."""
+    error_text = _error_chain_text(error)
+    if is_rate_limited_error(error):
+        return VOICE_QUOTA_MESSAGE
+    if isinstance(error, EmptyVoiceAudioError):
+        return "No usable recording was captured. Please record your question again."
+    if isinstance(error, UnsupportedVoiceAudioError):
+        return "This microphone recording format is not supported. Please record again and retry."
+    if isinstance(error, EmptyVoiceTranscriptError):
+        return "The recording was captured, but no spoken text was detected. Please speak clearly and retry."
+    if "ffmpeg" in error_text:
+        return "Audio conversion failed. Please record again or try a supported audio format."
+    if "invalid_argument" in error_text or "400" in error_text:
+        return "Gemini could not accept the audio/request format. Please record again and retry."
+    if "not configured" in error_text or "api key" in error_text:
+        return "Gemini is unavailable right now. Please retry later or use a text question."
+    return "The voice recording could not be processed. Please retry or type your question."
+
+
+def _rag_chat_error_message(error):
+    """Keep a retrieved-context quota failure distinct from a retrieval failure."""
+    if is_rate_limited_error(error):
+        return RAG_QUOTA_MESSAGE
+    return (
+        "StudyMate could not answer from the indexed material. Please retry; "
+        "the technical details were recorded in the server log."
+    )
+
+
 def create_gemini_llm():
     """Use one bounded Gemini configuration for every text-generation feature."""
     return ChatGoogleGenerativeAI(
@@ -498,11 +682,6 @@ def create_gemini_llm():
         retries=0,
         request_timeout=25,
     )
-
-
-def is_rate_limited_error(error):
-    error_text = str(error).lower()
-    return "resource_exhausted" in error_text or "rate limit" in error_text or "429" in error_text
 
 
 def safe_llm_invoke(llm, prompt, *, raise_on_failure=False):
@@ -1213,20 +1392,18 @@ def extract_visual_insights(file_bytes, extension, source_name, max_assets=3):
     return insights
 
 
-def answer_voice_tutor(audio_bytes, learning_context):
-    """Voice question -> Gemini Socratic response. Browser TTS speaks the returned text."""
-    temp_path = 'temp_voice_tutor.wav'
-    try:
-        with open(temp_path, 'wb') as handle:
-            handle.write(audio_bytes)
-        media_ref = client.files.upload(file=temp_path)
-        prompt = f"""
+def answer_voice_tutor(audio_bytes, audio_mime, learning_context):
+    """Transcribe a voice question, then answer from the certified study context."""
+    transcript = transcribe_voice_audio(audio_bytes, audio_mime)
+    prompt = f"""
 You are the StudyMate Voice Socratic Tutor.
-Understand the learner's spoken question from the attached audio.
 Use the certified learning context below as the primary scope.
 
 CERTIFIED LEARNING CONTEXT:
 {learning_context}
+
+LEARNER SPOKEN QUESTION:
+{transcript}
 
 Respond with:
 1. A short clarification or hint.
@@ -1234,14 +1411,8 @@ Respond with:
 3. If useful, one small example.
 Do not expose hidden reasoning or invent content outside the supplied context.
 """
-        return safe_generate_content(media_ref, prompt)
-    except Exception as error:
-        _log_runtime_error("Voice Tutor", error)
-        return 'I could not process the voice question right now. Please retry or use the text-based study tools.'
-    finally:
-        if os.path.exists(temp_path):
-            try: os.remove(temp_path)
-            except Exception: pass
+    response = safe_llm_invoke(create_gemini_llm(), prompt, raise_on_failure=True)
+    return transcript, response
 
 
 def render_voice_tutor(learning_context):
@@ -1261,20 +1432,44 @@ def render_voice_tutor(learning_context):
             "Voice Tutor uses the Certified Learning Module as its context. Run the Autonomous Workflow first, then return here."
         )
     if voice_question_audio is not None:
+        try:
+            audio_bytes, audio_mime, audio_name = _capture_audio_payload(
+                voice_question_audio, "Voice Tutor"
+            )
+            if audio_bytes != st.session_state.get("voice_audio_bytes"):
+                st.session_state.voice_tutor_output = None
+            st.session_state.voice_audio_bytes = audio_bytes
+            st.session_state.voice_audio_mime = audio_mime
+            st.session_state.voice_audio_name = audio_name
+        except Exception as error:
+            _log_runtime_error("Voice Tutor audio capture", error)
+            st.error(_voice_error_message(error))
+            return
+
         if st.button(
             "🎧 Analyze Voice Question",
             use_container_width=True,
             key="analyze_voice_tutor_question",
             disabled=not has_learning_context,
         ):
-            with st.spinner("Listening and preparing a Socratic response..."):
-                st.session_state.voice_tutor_output = answer_voice_tutor(
-                    voice_question_audio.getvalue(), learning_context
+            try:
+                with st.spinner("Listening and preparing a Socratic response..."):
+                    transcript, response = answer_voice_tutor(
+                        st.session_state.voice_audio_bytes,
+                        st.session_state.voice_audio_mime,
+                        learning_context,
+                    )
+                st.session_state.voice_transcript = transcript
+                st.session_state.voice_question = transcript
+                st.session_state.voice_tutor_output = response
+            except Exception as error:
+                _log_runtime_error("Voice Tutor", error)
+                st.error(_voice_error_message(error))
+            else:
+                log_agent_event(
+                    "Voice Socratic Tutor", "COMPLETED",
+                    "Voice question transcribed and tutor response created"
                 )
-            log_agent_event(
-                "Voice Socratic Tutor", "COMPLETED",
-                "Voice question processed and tutor response created"
-            )
     if st.session_state.voice_tutor_output:
         st.markdown("#### 🤖 Spoken Tutor Response")
         st.markdown(st.session_state.voice_tutor_output)
@@ -1406,6 +1601,7 @@ def reset_agent_workflow():
     st.session_state.agent_architect_output = None
     st.session_state.agent_examiner_output = None
     st.session_state.agent_qa_output = None
+    st.session_state.certified_module = None
     st.session_state.agent_retrieved_sources = []
     st.session_state.agent_audit_log = []
     st.session_state.workflow_stage_states = {}
@@ -1650,14 +1846,21 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                     st.error("The local vector store is unavailable, so lecture audio cannot be indexed yet.")
                 else:
                     with st.spinner("⚡ Transcribing and indexing lecture audio..."):
-                        temp_lecture_path = "temp_lecture.wav"
                         try:
-                            audio_bytes = lecture_audio.getvalue()
-                            with open(temp_lecture_path, "wb") as f:
-                                f.write(audio_bytes)
-
-                            media_ref = client.files.upload(file=temp_lecture_path)
-                            transcript_text = safe_generate_content(media_ref, "Thoroughly transcribe this lecture into clean, structured study notes.")
+                            audio_bytes, audio_mime, audio_name = _capture_audio_payload(
+                                lecture_audio, "Study Workspace lecture audio"
+                            )
+                            st.session_state.voice_audio_bytes = audio_bytes
+                            st.session_state.voice_audio_mime = audio_mime
+                            st.session_state.voice_audio_name = audio_name
+                            transcript_text = _generate_uploaded_audio_text(
+                                audio_bytes,
+                                audio_mime,
+                                "Thoroughly transcribe this lecture into clean, structured study notes.",
+                            )
+                            if not transcript_text:
+                                raise EmptyVoiceTranscriptError("Gemini returned an empty lecture transcription.")
+                            st.session_state.voice_transcript = transcript_text
                             chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(transcript_text)
                             for i in range(0, len(chunks), 15):
                                 batch = chunks[i:i + 15]
@@ -1674,13 +1877,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                                 raise RuntimeError("The lecture was indexed but the retriever could not be refreshed.")
                         except Exception as ex:
                             _log_runtime_error("Lecture audio indexing", ex)
-                            st.error("The lecture audio could not be indexed. Please retry; the technical details were recorded in the server log.")
-                        finally:
-                            if os.path.exists(temp_lecture_path):
-                                try:
-                                    os.remove(temp_lecture_path)
-                                except OSError:
-                                    pass
+                            st.error(_voice_error_message(ex))
 
     database_ready = vector_store_ready()
     database_label = "Neural Database Active" if database_ready else "Neural Database Unavailable"
@@ -1788,7 +1985,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                             st.warning(_grounded_chat_unavailable_message())
                     except Exception as error:
                         _log_runtime_error("RAG chat", error)
-                        st.error("StudyMate could not answer from the indexed material. Please retry; the technical details were recorded in the server log.")
+                        st.warning(_rag_chat_error_message(error))
 
         if chat_input_val:
             if hasattr(chat_input_val, "text") and chat_input_val.text:
@@ -1824,7 +2021,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                                 st.warning(_grounded_chat_unavailable_message())
                         except Exception as error:
                             _log_runtime_error("RAG chat", error)
-                            st.error("StudyMate could not answer from the indexed material. Please retry; the technical details were recorded in the server log.")
+                            st.warning(_rag_chat_error_message(error))
 
             if hasattr(chat_input_val, "audio") and chat_input_val.audio:
                 audio_file = chat_input_val.audio
@@ -1834,28 +2031,25 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                 
                 with st.chat_message("assistant", avatar="🤖"):
                     with st.spinner("🎙️ Transcribing and processing voice recording..."):
-                        temp_audio_path = "temp_chat_voice.wav"
                         try:
-                            audio_bytes = audio_file.getvalue()
-                            with open(temp_audio_path, "wb") as af:
-                                af.write(audio_bytes)
-                            
-                            audio_ref = client.files.upload(file=temp_audio_path)
-                            voice_answer = safe_generate_content(audio_ref, "Transcribe this audio recording and answer any questions asked in it.")
-                            if os.path.exists(temp_audio_path):
-                                os.remove(temp_audio_path)
-                                
-                            st.markdown(voice_answer)
-                            st.session_state.messages.append({"role": "assistant", "content": voice_answer})
+                            audio_bytes, audio_mime, audio_name = _capture_audio_payload(
+                                audio_file, "Study Workspace voice input"
+                            )
+                            st.session_state.voice_audio_bytes = audio_bytes
+                            st.session_state.voice_audio_mime = audio_mime
+                            st.session_state.voice_audio_name = audio_name
+                            transcript = transcribe_voice_audio(audio_bytes, audio_mime)
+                            st.session_state.voice_transcript = transcript
+                            st.session_state.voice_question = transcript
+                            st.session_state.pending_query = transcript
+                            st.caption("Voice recording transcribed. Searching your grounded learning materials…")
                         except Exception as error:
                             _log_runtime_error("Chat voice input", error)
-                            st.error("The voice note could not be processed. Please retry or use a text question.")
-                        finally:
-                            if os.path.exists(temp_audio_path):
-                                try:
-                                    os.remove(temp_audio_path)
-                                except OSError:
-                                    pass
+                            st.error(_voice_error_message(error))
+                        else:
+                            # The next run deliberately reuses the existing text/RAG path,
+                            # so spoken questions keep the same retrieval and chat history.
+                            st.rerun()
     else:
         st.info("💡 Click **'📄 Upload Docs'** above or use **'🎙️ Audio Notes'** to activate your interactive AI workspace.")
 
@@ -2539,6 +2733,7 @@ Audit, repair where needed, and return the complete certified module.
                         st.stop()
 
                 st.session_state.agent_qa_output = final_module
+                st.session_state.certified_module = final_module
                 module_qa_verified = "Certification Status: APPROVED" in str(final_module)
                 if module_qa_verified:
                     st.success("✅ QA reflection, correction and certification complete.")
