@@ -59,7 +59,6 @@ st.markdown("""
         --soft-shadow: 0 10px 30px rgba(49, 83, 141, 0.08);
     }
 
-    header[data-testid="stHeader"] { display: none !important; }
     .stApp, [data-testid="stAppViewContainer"] {
         background: linear-gradient(135deg, #FBFDFF 0%, #F6F9FF 48%, #F9FBFF 100%) !important;
         color: var(--ink) !important;
@@ -82,6 +81,11 @@ st.markdown("""
     section[data-testid="stSidebar"] > div {
         background: transparent !important;
         padding: 1rem 0.72rem 1.35rem !important;
+    }
+    /* Keep Streamlit's native sidebar controls visible in both sidebar states. */
+    [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapseButton"] button,
+    [data-testid="stSidebarCollapsedControl"], [data-testid="stSidebarCollapsedControl"] button {
+        visibility: visible !important;
     }
     .sidebar-brand { display:flex; align-items:center; gap:10px; padding: 0.42rem 0.4rem 1rem; }
     .brand-mark {
