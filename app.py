@@ -121,21 +121,40 @@ st.markdown("""
     .status-dot { width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 0 3px rgba(16,185,129,.10); flex:none; }
     .status-dot.warning { background:var(--orange); box-shadow:0 0 0 3px rgba(245,158,11,.12); }
 
-    /* Top bar and dashboard surfaces */
-    .topbar {
-        display:flex; align-items:center; gap:14px; min-height:56px; padding:8px 10px 12px;
-        border-bottom:1px solid rgba(221,231,245,.85); margin-bottom:1rem;
+    /* Interactive top bar. Keep its controls native so their state is accessible. */
+    .st-key-topbar_shell {
+        min-height:56px; padding:8px 10px 12px; margin-bottom:1rem;
+        border-bottom:1px solid rgba(221,231,245,.85);
     }
-    .topbar-search { flex:1; min-width:220px; display:flex; align-items:center; gap:10px; color:#8090B0; background:#FFFFFF; border:1px solid var(--line); border-radius:13px; padding:10px 13px; box-shadow:0 5px 14px rgba(49,83,141,.04); font-size:.84rem; }
-    .search-glyph { color:var(--blue); font-weight:900; font-size:1.05rem; }
-    .shortcut-key { margin-left:auto; color:var(--blue); background:#EFF6FF; border:1px solid #D8E8FF; border-radius:7px; padding:2px 7px; font-size:.68rem; font-weight:800; }
+    .st-key-topbar_shell [data-testid="stTextInput"] { margin-bottom:0 !important; }
+    .st-key-topbar_shell [data-testid="stTextInput"] [data-baseweb="input"] {
+        min-height:42px; background:#FFFFFF; border:1px solid var(--line); border-radius:13px;
+        box-shadow:0 5px 14px rgba(49,83,141,.04);
+    }
+    .st-key-topbar_shell [data-testid="stTextInput"] input { font-size:.84rem; }
     .topbar-statuses { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
     .status-pill { display:inline-flex; gap:7px; align-items:center; color:var(--ink); background:#FFFFFF; border:1px solid var(--line); border-radius:11px; padding:7px 10px; font-size:.73rem; font-weight:800; white-space:nowrap; box-shadow:0 4px 12px rgba(49,83,141,.035); }
     .status-pill .status-dot { width:7px; height:7px; }
     .status-pill.blue .status-dot { background:var(--blue); box-shadow:0 0 0 3px rgba(59,130,246,.10); }
     .status-pill.violet .status-dot { background:var(--violet); box-shadow:0 0 0 3px rgba(139,92,246,.10); }
-    .topbar-bell { color:var(--ink); font-size:1rem; padding:7px; border-radius:10px; border:1px solid var(--line); background:#fff; }
-    .profile-avatar { width:34px; height:34px; border-radius:50%; color:#fff; display:grid; place-items:center; font-size:.76rem; font-weight:850; background:linear-gradient(135deg,var(--blue),var(--violet)); box-shadow:0 6px 15px rgba(59,130,246,.2); }
+    .st-key-topbar_notifications button, .st-key-topbar_profile button {
+        min-width:36px !important; width:36px !important; height:36px !important; padding:0 !important;
+        display:inline-flex !important; align-items:center !important; justify-content:center !important;
+        border-radius:10px !important; border:1px solid var(--line) !important; background:#FFFFFF !important;
+        color:var(--ink) !important; box-shadow:0 4px 12px rgba(49,83,141,.035) !important;
+    }
+    .st-key-topbar_notifications button [data-testid="stMarkdownContainer"] { display:none !important; }
+    .st-key-topbar_notifications [data-testid="stPopoverButton"] [aria-hidden="true"],
+    .st-key-topbar_profile [data-testid="stPopoverButton"] [aria-hidden="true"] { display:none !important; }
+    .st-key-topbar_notifications button:hover { background:#EEF5FF !important; border-color:#BFD7FB !important; }
+    .st-key-topbar_profile button {
+        border:0 !important; border-radius:50% !important; color:#FFFFFF !important;
+        background:linear-gradient(135deg,var(--blue),var(--violet)) !important;
+        box-shadow:0 6px 15px rgba(59,130,246,.20) !important;
+    }
+    .st-key-topbar_profile button [data-testid="stMarkdownContainer"] p {
+        margin:0 !important; color:#FFFFFF !important; font-size:.76rem !important; font-weight:850 !important;
+    }
 
     .hero-banner, .hero-box {
         position:relative; overflow:hidden; border:1px solid #DDEBFF; border-radius:22px; padding:1.9rem 2.15rem;
@@ -292,8 +311,17 @@ st.markdown("""
     .footer-bar { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:.72rem; padding:1rem .2rem; }
 
     @media (max-width: 1260px) { .workflow-pipeline { grid-template-columns:repeat(3,minmax(145px,1fr)); } .workflow-stage::after { display:none; } .hero-content { max-width:63%; } }
-    @media (max-width: 900px) { .topbar { align-items:flex-start; flex-wrap:wrap; } .topbar-statuses { justify-content:flex-start; } .hero-content { max-width:100%; } .hero-visual { opacity:.28; } .followup-grid { grid-template-columns:repeat(3,minmax(145px,1fr)); } }
-    @media (max-width: 700px) { header[data-testid="stHeader"] { display:flex !important; background:#FFFFFF !important; border-bottom:1px solid var(--line); } .block-container { padding: 3.65rem .7rem 4.5rem !important; } .hero-banner, .hero-box { padding:1.35rem 1.2rem; } .hero-title { font-size:2.15rem; } .hero-visual { display:none; } .workflow-pipeline, .followup-grid { grid-template-columns:repeat(2,minmax(135px,1fr)); } .topbar-search { width:100%; flex-basis:100%; } }
+    @media (max-width: 900px) { .topbar-statuses { justify-content:flex-start; } .hero-content { max-width:100%; } .hero-visual { opacity:.28; } .followup-grid { grid-template-columns:repeat(3,minmax(145px,1fr)); } }
+    @media (max-width: 800px) {
+        .st-key-topbar_shell [data-testid="stHorizontalBlock"] { flex-wrap:wrap !important; }
+        .st-key-topbar_shell [data-testid="stColumn"]:has(.st-key-topbar_search_query) { flex:1 0 100% !important; width:100% !important; min-width:100% !important; }
+        .st-key-topbar_shell [data-testid="stColumn"]:has(.topbar-statuses) { flex:1 1 0 !important; width:auto !important; min-width:0 !important; }
+        .st-key-topbar_shell [data-testid="stColumn"]:has(.st-key-topbar_notifications),
+        .st-key-topbar_shell [data-testid="stColumn"]:has(.st-key-topbar_profile) { flex:0 0 36px !important; width:36px !important; min-width:36px !important; }
+        .topbar-statuses { gap:5px; }
+        .status-pill { padding:5px 7px; font-size:.67rem; }
+    }
+    @media (max-width: 700px) { header[data-testid="stHeader"] { display:flex !important; background:#FFFFFF !important; border-bottom:1px solid var(--line); } .block-container { padding: 3.65rem .7rem 4.5rem !important; } .hero-banner, .hero-box { padding:1.35rem 1.2rem; } .hero-title { font-size:2.15rem; } .hero-visual { display:none; } .workflow-pipeline, .followup-grid { grid-template-columns:repeat(2,minmax(135px,1fr)); } }
     </style>
 """, unsafe_allow_html=True)
 
@@ -591,28 +619,130 @@ def _stage_status(stage, completed_when=False):
     return "READY", None
 
 
+def _header_gemini_label():
+    """Return a truthful, non-sensitive Gemini availability label for the header."""
+    return "Gemini Connected" if api_key and client is not None else "Gemini Unavailable"
+
+
+def _header_rag_label():
+    """Describe whether grounded questions can use the active session retriever."""
+    if not vector_store_ready():
+        return "RAG Unavailable" if st.session_state.get("vector_store_error") else "RAG Initializing"
+    if not st.session_state.get("processed_files"):
+        return "RAG Awaiting Materials"
+    if st.session_state.get("retriever") is None:
+        return "RAG Initializing"
+    return "RAG Ready"
+
+
+def _workflow_status_label():
+    """Summarize actual workflow state without implying that agents are running."""
+    stage_states = st.session_state.get("workflow_stage_states", {})
+    statuses = [
+        str(state.get("status", "")).upper() if isinstance(state, dict) else str(state).upper()
+        for state in stage_states.values()
+    ]
+    if "RUNNING" in statuses:
+        return "Running"
+    if any(status in {"FAILED", "BLOCKED"} for status in statuses):
+        return "Needs attention"
+    if st.session_state.get("agent_qa_output"):
+        return "Certified module ready"
+    if st.session_state.get("agent_audit_log"):
+        return "Latest execution"
+    return "Ready to run"
+
+
+def _grounded_chat_ready():
+    """Require both source metadata and an active retriever before calling Gemini."""
+    return bool(st.session_state.get("processed_files")) and st.session_state.get("retriever") is not None
+
+
+def _grounded_chat_unavailable_message():
+    if not st.session_state.get("processed_files"):
+        return "Upload learning materials first to ask grounded questions."
+    return "Learning materials are still preparing for grounded questions. Please wait a moment and try again."
+
+
+def _current_profile_role():
+    role = str(st.session_state.get("multi_agent_audience", "Student")).strip()
+    return role if role in {"Student", "Teacher"} else "Student"
+
+
+def submit_topbar_search():
+    """Route the native header search through the existing Study Workspace chat flow."""
+    query = str(st.session_state.get("topbar_search_query", "")).strip()
+    if not query:
+        return
+    _navigate_to(STUDY_WORKSPACE_ROUTE)
+    st.session_state.pending_query = query
+
+
 def render_topbar():
-    gemini_label = "Gemini Connected" if api_key else "Gemini Not Configured"
-    rag_label = rag_status_label()
-    st.markdown(
-        f"""
-        <div class="topbar">
-          <div class="topbar-search" aria-label="Visual search prompt">
-            <span class="search-glyph">⌕</span>
-            <span>Search your documents, ask StudyMate anything…</span>
-            <span class="shortcut-key">Ctrl + K</span>
-          </div>
-          <div class="topbar-statuses">
-            <span class="status-pill"><span class="status-dot"></span>{_safe_html(gemini_label)}</span>
-            <span class="status-pill blue"><span class="status-dot"></span>{_safe_html(rag_label)}</span>
-            <span class="status-pill violet"><span class="status-dot"></span>4 Agent Roles</span>
-            <span class="topbar-bell" title="Notifications"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span>
-            <span class="profile-avatar" title="StudyMate profile">SH</span>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    gemini_label = _header_gemini_label()
+    rag_label = _header_rag_label()
+    workflow_label = _workflow_status_label()
+    gemini_dot_class = "" if gemini_label == "Gemini Connected" else " warning"
+    rag_dot_class = "" if rag_label == "RAG Ready" else " warning"
+
+    with st.container(key="topbar_shell"):
+        search_col, status_col, bell_col, profile_col = st.columns(
+            [6.1, 3.45, 0.45, 0.55],
+            gap="small",
+            vertical_alignment="center",
+            wrap=True,
+        )
+        with search_col:
+            st.text_input(
+                "Search StudyMate",
+                key="topbar_search_query",
+                type="search",
+                placeholder="Search your documents, ask StudyMate anything...",
+                icon=":material/search:",
+                label_visibility="collapsed",
+                on_change=submit_topbar_search,
+            )
+        with status_col:
+            st.markdown(
+                f"""
+                <div class="topbar-statuses" aria-label="Current system availability">
+                  <span class="status-pill"><span class="status-dot{gemini_dot_class}"></span>{_safe_html(gemini_label)}</span>
+                  <span class="status-pill blue"><span class="status-dot{rag_dot_class}"></span>{_safe_html(rag_label)}</span>
+                  <span class="status-pill violet"><span class="status-dot"></span>4 Agent Roles</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with bell_col:
+            with st.popover(
+                "System status",
+                icon=":material/notifications:",
+                type="tertiary",
+                help="View current StudyMate system status",
+                key="topbar_notifications",
+            ):
+                st.markdown("#### System status")
+                st.caption("Live state for this browser session")
+                st.markdown(f"**Gemini:** {_safe_html(gemini_label.replace('Gemini ', ''))}")
+                st.markdown(f"**RAG:** {_safe_html(rag_label.replace('RAG ', ''))}")
+                st.markdown(f"**Indexed learning materials:** {len(st.session_state.get('processed_files', []))}")
+                st.markdown(f"**Workflow:** {_safe_html(workflow_label)}")
+        with profile_col:
+            with st.popover(
+                "SH",
+                type="tertiary",
+                help="Open StudyMate demo profile",
+                key="topbar_profile",
+            ):
+                st.markdown("#### StudyMate AI Pro V2")
+                st.caption("Hackathon Demo")
+                st.markdown(f"**Role:** {_safe_html(_current_profile_role())}")
+                st.markdown(
+                    "**System status:** "
+                    f"Gemini {_safe_html(gemini_label.replace('Gemini ', ''))} · "
+                    f"RAG {_safe_html(rag_label.replace('RAG ', ''))} · "
+                    f"{_safe_html(workflow_label)}"
+                )
 
 
 def _navigate_to(page):
@@ -1630,7 +1760,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
             with st.chat_message("assistant", avatar="🤖"):
                 with st.spinner("🧠 Searching Neural Database..."):
                     try:
-                        if 'retriever' in st.session_state:
+                        if _grounded_chat_ready():
                             docs = st.session_state['retriever'].invoke(chat_query)
                             if not docs:
                                 st.info("This context is not available in your provided materials.")
@@ -1651,7 +1781,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                                 st.markdown(answer_text)
                                 st.session_state.messages.append({"role": "assistant", "content": answer_text})
                         else:
-                            st.warning("⚠️ Please upload study files using the 📄 Upload Docs button first.")
+                            st.warning(_grounded_chat_unavailable_message())
                     except Exception as error:
                         _log_runtime_error("RAG chat", error)
                         st.error("StudyMate could not answer from the indexed material. Please retry; the technical details were recorded in the server log.")
@@ -1666,7 +1796,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                 with st.chat_message("assistant", avatar="🤖"):
                     with st.spinner("🧠 Searching Neural Database..."):
                         try:
-                            if 'retriever' in st.session_state:
+                            if _grounded_chat_ready():
                                 docs = st.session_state['retriever'].invoke(user_text)
                                 if not docs:
                                     st.info("This context is not available in your provided materials.")
@@ -1687,7 +1817,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                                     st.markdown(answer_text)
                                     st.session_state.messages.append({"role": "assistant", "content": answer_text})
                             else:
-                                st.warning("⚠️ Please upload study files using the 📄 Upload Docs button first.")
+                                st.warning(_grounded_chat_unavailable_message())
                         except Exception as error:
                             _log_runtime_error("RAG chat", error)
                             st.error("StudyMate could not answer from the indexed material. Please retry; the technical details were recorded in the server log.")
