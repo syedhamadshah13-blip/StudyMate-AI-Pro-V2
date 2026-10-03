@@ -83,7 +83,7 @@ st.markdown("""
     }
     .block-container {
         max-width: 1740px !important;
-        padding: 1.15rem 1.4rem 5.5rem !important;
+        padding: 4.25rem 1.4rem 5.5rem !important;
     }
     p, label, [data-testid="stMarkdownContainer"] { color: var(--ink); }
     .stCaption, [data-testid="stCaptionContainer"] { color: var(--muted) !important; }
@@ -342,7 +342,7 @@ st.markdown("""
         .topbar-statuses { gap:5px; }
         .status-pill { padding:5px 7px; font-size:.67rem; }
     }
-    @media (max-width: 700px) { header[data-testid="stHeader"] { display:flex !important; background:#FFFFFF !important; border-bottom:1px solid var(--line); } .block-container { padding: 3.65rem .7rem 4.5rem !important; } .hero-banner, .hero-box { padding:1.35rem 1.2rem; } .hero-title { font-size:2.15rem; } .hero-visual { display:none; } .workflow-pipeline, .followup-grid { grid-template-columns:repeat(2,minmax(135px,1fr)); } }
+    @media (max-width: 700px) { header[data-testid="stHeader"] { display:flex !important; background:#FFFFFF !important; border-bottom:1px solid var(--line); } .block-container { padding: 4.25rem .7rem 4.5rem !important; } .hero-banner, .hero-box { padding:1.35rem 1.2rem; } .hero-title { font-size:2.15rem; } .hero-visual { display:none; } .workflow-pipeline, .followup-grid { grid-template-columns:repeat(2,minmax(135px,1fr)); } }
     </style>
 """, unsafe_allow_html=True)
 
@@ -1109,9 +1109,22 @@ def normalize_grounded_rag_answer(answer_text, context):
         if match.strip()
     }
     if not cited_sources:
-        raise TextGenerationProviderError(
-            "The grounded response omitted the required retrieved-source citation."
+        if not retrieved_sources:
+            raise TextGenerationProviderError(
+                "The grounded response omitted the required retrieved-source citation."
+            )
+        # The answer was generated only from the retrieved context, but GPT-OSS can
+        # occasionally omit the requested inline Markdown label. Attach a truthful
+        # reference list from that same context rather than discard a usable grounded
+        # answer or manufacture a source claim.
+        logger.info(
+            "Grounded RAG response omitted inline citations; attached %d retrieved source reference(s).",
+            len(retrieved_sources),
         )
+        source_references = " · ".join(
+            f"[Source: {source}]" for source in sorted(retrieved_sources)
+        )
+        return f"{answer_text}\n\n**Retrieved sources:** {source_references}"
     if retrieved_sources and not (cited_sources & retrieved_sources):
         raise TextGenerationProviderError(
             "The grounded response did not cite one of the retrieved study sources."
@@ -2284,7 +2297,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                         if _grounded_chat_ready():
                             docs = st.session_state['retriever'].invoke(chat_query)
                             if not docs:
-                                st.info("This context is not available in your provided materials.")
+                                st.info("I couldn't find enough relevant information in the indexed material for that question.")
                             else:
                                 context = "\n\n".join([f"[Source: {doc.metadata.get('source', 'Uploaded Notes')}]: {doc.page_content}" for doc in docs])
                                 llm = create_gemini_llm()
@@ -2292,7 +2305,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                                 RULES:
                                 1. Do NOT give the direct answer immediately. Give a hint or guide the student to the next logical step.
                                 2. If the answer cannot be found in the provided context, you MUST reply verbatim: "This context is not available in your provided materials."
-                                3. Always cite a retrieved source using its exact [Source: filename] label from the context. Do not use parenthesized citations.
+                                3. Always finish with a `Retrieved sources:` line containing at least one exact [Source: filename] label from the context. Do not use parenthesized citations.
                                 
                                 Context Notes:
                                 {context}
@@ -2327,7 +2340,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                             if _grounded_chat_ready():
                                 docs = st.session_state['retriever'].invoke(user_text)
                                 if not docs:
-                                    st.info("This context is not available in your provided materials.")
+                                    st.info("I couldn't find enough relevant information in the indexed material for that question.")
                                 else:
                                     context = "\n\n".join([f"[Source: {doc.metadata.get('source', 'Uploaded Notes')}]: {doc.page_content}" for doc in docs])
                                     llm = create_gemini_llm()
@@ -2335,7 +2348,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                                     RULES:
                                     1. Do NOT give the direct answer immediately. Give a hint or guide the student to the next logical step.
                                     2. If the answer cannot be found in the provided context, you MUST reply verbatim: "This context is not available in your provided materials."
-                                    3. Always cite a retrieved source using its exact [Source: filename] label from the context. Do not use parenthesized citations.
+                                    3. Always finish with a `Retrieved sources:` line containing at least one exact [Source: filename] label from the context. Do not use parenthesized citations.
                                     
                                     Context Notes:
                                     {context}
