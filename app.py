@@ -33,15 +33,28 @@ except ImportError:  # Keep startup safe if the optional fallback package is abs
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
+gemini_backup_api_key = os.getenv("GEMINI_API_KEY_2")
 groq_api_key = os.getenv("GROQ_API_KEY")
 # Allow Streamlit to start and show its configuration guidance before a Gemini
 # key has been configured. Calls that need Gemini are already protected by the
 # existing safe wrappers/event-level fallbacks below.
-client = genai.Client(api_key=api_key) if api_key else None
 logger = logging.getLogger("studymate")
+client = None
+if api_key:
+    try:
+        client = genai.Client(api_key=api_key)
+    except Exception as error:
+        logger.error("Gemini primary initialization failed: %s", type(error).__name__)
 
-# Groq is deliberately initialized only when the separately configured fallback
-# key is present. It is used only by the shared text-generation helper below.
+backup_client = None
+if gemini_backup_api_key:
+    try:
+        backup_client = genai.Client(api_key=gemini_backup_api_key)
+    except Exception as error:
+        logger.error("Gemini backup initialization failed: %s", type(error).__name__)
+
+# Groq is initialized only when the separately configured fallback key is
+# present. It remains the final fallback for text-generation workflows.
 groq_client = None
 if groq_api_key and Groq is not None:
     try:
@@ -503,7 +516,7 @@ def rag_status_label():
 def _safe_error_detail(error):
     """Keep useful server diagnostics without ever recording configured API keys."""
     detail = f"{type(error).__name__}: {error}"
-    for secret in (api_key, groq_api_key):
+    for secret in (api_key, gemini_backup_api_key, groq_api_key):
         if secret:
             detail = detail.replace(secret, "[REDACTED]")
     return detail
@@ -513,13 +526,58 @@ def _log_runtime_error(area, error):
     logger.error("%s failed: %s", area, _safe_error_detail(error))
 
 
-def safe_generate_content(contents, prompt):
+class GeminiNativeProvidersUnavailableError(RuntimeError):
+    """Raised after eligible temporary failures from both Gemini-native clients."""
+
+
+def _run_gemini_native_with_backup(operation, feature_name):
+    """Run Gemini-native work through Primary, then Backup for safe availability cases."""
+    if client is None:
+        # A backup key is an independently configured Gemini client.  When the
+        # primary client cannot be initialized at startup, it is safe to begin
+        # with that client rather than incorrectly reporting a Gemini-native
+        # feature as unavailable.
+        if backup_client is not None:
+            logger.warning(
+                "Gemini Primary is not configured for %s; using Gemini Backup.",
+                feature_name,
+            )
+            return operation(backup_client)
+        raise RuntimeError("Gemini primary client is not configured.")
+
     try:
-        res = client.models.generate_content(model='gemini-3.6-flash', contents=[contents, prompt])
-        return res.text
-    except Exception as e:
-        _log_runtime_error("Gemini media generation", e)
-        raise RuntimeError("Gemini could not process the media request.") from e
+        return operation(client)
+    except Exception as primary_error:
+        if not is_provider_fallback_eligible(primary_error):
+            raise
+        if backup_client is None:
+            raise
+
+        logger.warning(
+            "Gemini Primary was unavailable for %s; using Gemini Backup. %s",
+            feature_name,
+            _safe_error_detail(primary_error),
+        )
+        try:
+            return operation(backup_client)
+        except Exception as backup_error:
+            _log_runtime_error(f"Gemini Backup {feature_name}", backup_error)
+            if is_provider_fallback_eligible(backup_error):
+                raise GeminiNativeProvidersUnavailableError(
+                    "Gemini Primary and Gemini Backup are temporarily unavailable."
+                ) from backup_error
+            raise
+
+
+def safe_generate_content(contents, prompt):
+    """Retain the existing helper for portable Gemini content requests."""
+    response = _run_gemini_native_with_backup(
+        lambda active_client: active_client.models.generate_content(
+            model='gemini-3.6-flash', contents=[contents, prompt]
+        ),
+        "media generation",
+    )
+    return str(getattr(response, "text", "") or "")
 
 
 class VoiceAudioInputError(ValueError):
@@ -603,22 +661,20 @@ def _capture_audio_payload(audio_file, source):
 
 
 def _generate_audio_text(audio_bytes, audio_mime, prompt):
-    """Submit short microphone audio inline so Gemini receives the real MIME type."""
-    if client is None:
-        raise RuntimeError("Gemini client is not configured.")
-
+    """Submit short microphone audio inline through Gemini Primary then Backup."""
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime)
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=[audio_part, prompt],
+    response = _run_gemini_native_with_backup(
+        lambda active_client: active_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[audio_part, prompt],
+        ),
+        "voice transcription",
     )
     return str(getattr(response, "text", "") or "").strip()
 
 
 def _generate_uploaded_audio_text(audio_bytes, audio_mime, prompt):
-    """Keep longer lecture indexing on Gemini's file API with its actual MIME type."""
-    if client is None:
-        raise RuntimeError("Gemini client is not configured.")
+    """Keep lecture indexing on Gemini's file API with a Primary-to-Backup retry."""
 
     temp_path = None
     try:
@@ -630,15 +686,21 @@ def _generate_uploaded_audio_text(audio_bytes, audio_mime, prompt):
             audio_handle.write(audio_bytes)
             temp_path = audio_handle.name
 
-        media_ref = client.files.upload(
-            file=temp_path,
-            config=types.UploadFileConfig(mime_type=audio_mime),
+        def generate_for_client(active_client):
+            media_ref = active_client.files.upload(
+                file=temp_path,
+                config=types.UploadFileConfig(mime_type=audio_mime),
+            )
+            response = active_client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=[media_ref, prompt],
+            )
+            return str(getattr(response, "text", "") or "").strip()
+
+        return _run_gemini_native_with_backup(
+            generate_for_client,
+            "lecture audio transcription",
         )
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[media_ref, prompt],
-        )
-        return str(getattr(response, "text", "") or "").strip()
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -648,7 +710,7 @@ def _generate_uploaded_audio_text(audio_bytes, audio_mime, prompt):
 
 
 def transcribe_voice_audio(audio_bytes, audio_mime):
-    """Return a validated transcript before the existing text/RAG flow runs."""
+    """Return a validated Gemini Primary-to-Backup transcript for the existing RAG flow."""
     transcript = _generate_audio_text(audio_bytes, audio_mime, VOICE_TRANSCRIPTION_PROMPT)
     if not transcript:
         raise EmptyVoiceTranscriptError("Gemini returned an empty transcription.")
@@ -676,7 +738,7 @@ def is_rate_limited_error(error):
 
 
 class BothAIProvidersUnavailableError(RuntimeError):
-    """Raised only after an eligible Gemini failure and a transient Groq fallback failure."""
+    """Raised after temporary failures exhaust the configured text-provider route."""
 
 
 class TextGenerationProviderError(RuntimeError):
@@ -750,8 +812,8 @@ def is_both_ai_providers_unavailable_error(error):
 
 
 def text_generation_provider_ready():
-    """A text request can proceed when Gemini or the configured Groq fallback is available."""
-    return bool(api_key) or groq_client is not None
+    """A text request can proceed when a Gemini client or Groq is configured."""
+    return client is not None or backup_client is not None or groq_client is not None
 
 
 def _text_generation_error_message(error, default_message):
@@ -794,6 +856,33 @@ def _groq_text_completion(formatted_prompt, max_completion_tokens):
     return response_text
 
 
+def _invoke_gemini_text_provider(llm, formatted_prompt, provider_label):
+    """Call one Gemini text client without turning local validation errors into failovers."""
+    for attempt in range(2):
+        try:
+            response = llm.invoke(formatted_prompt)
+        except Exception as error:
+            if is_provider_fallback_eligible(error):
+                raise
+            # Preserve the original one short retry for non-provider Gemini errors.
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            _log_runtime_error(f"{provider_label} language-model request", error)
+            raise TextGenerationProviderError(
+                f"{provider_label} could not complete the text request after retrying."
+            ) from error
+
+        # Keep response formatting and empty-content validation outside the provider
+        # exception handling so malformed local data never changes providers.
+        text = extract_llm_text(response.content if hasattr(response, "content") else response)
+        if not str(text).strip():
+            raise TextGenerationProviderError(f"{provider_label} returned an empty text completion.")
+        return text
+
+    raise TextGenerationProviderError(f"{provider_label} could not complete the text request.")
+
+
 def generate_text_with_fallback(
     llm,
     formatted_prompt,
@@ -801,68 +890,88 @@ def generate_text_with_fallback(
     feature_name="Text generation",
     max_completion_tokens=4096,
 ):
-    """Use Gemini first, then Groq only for a known temporary Gemini provider failure."""
-    gemini_error = None
-    gemini_was_attempted = llm is not None
+    """Use Gemini Primary, then Backup, then Groq for eligible provider outages."""
+    primary_error = None
+    primary_was_attempted = llm is not None
 
-    if llm is not None:
-        for attempt in range(2):
-            try:
-                response = llm.invoke(formatted_prompt)
-            except Exception as error:
-                gemini_error = error
-                # Do not retry known provider-availability failures: switch once to
-                # the backup rather than compounding a quota or timeout condition.
-                if is_provider_fallback_eligible(error):
-                    break
-                # Preserve the app's original one short retry for non-fallback
-                # Gemini request failures. Local coding/RAG errors never reach here.
-                if attempt == 0:
-                    time.sleep(2)
-                    continue
-                _log_runtime_error("Gemini language-model request", error)
-                raise TextGenerationProviderError(
-                    "Gemini could not complete the text request after retrying."
-                ) from error
-            else:
-                # Keep response formatting outside the provider try/except so a local
-                # parsing/programming problem cannot mistakenly trigger Groq.
-                text = extract_llm_text(
-                    response.content if hasattr(response, "content") else response
-                )
-                if not str(text).strip():
-                    raise TextGenerationProviderError("Gemini returned an empty text completion.")
-                _record_text_provider("Gemini", feature_name)
-                return text
+    if primary_was_attempted:
+        try:
+            primary_text = _invoke_gemini_text_provider(
+                llm, formatted_prompt, "Gemini Primary"
+            )
+        except Exception as error:
+            primary_error = error
+            if not is_provider_fallback_eligible(error):
+                raise
+        else:
+            _record_text_provider("Gemini Primary", feature_name)
+            return primary_text
     else:
-        gemini_error = TextGenerationProviderError("Gemini text provider is not configured.")
+        primary_error = TextGenerationProviderError("Gemini Primary is not configured.")
 
-    if not is_provider_fallback_eligible(gemini_error) and gemini_was_attempted:
-        _log_runtime_error("Gemini language-model request", gemini_error)
-        raise TextGenerationProviderError("Gemini could not complete the text request.") from gemini_error
+    backup_error = None
+    backup_llm = create_backup_gemini_llm()
+    backup_is_next = backup_llm is not None and (
+        not primary_was_attempted or is_provider_fallback_eligible(primary_error)
+    )
+    if backup_is_next:
+        if primary_was_attempted:
+            logger.warning(
+                "Gemini Primary was unavailable for %s; using Gemini Backup. %s",
+                feature_name,
+                _safe_error_detail(primary_error),
+            )
+        else:
+            logger.warning(
+                "Gemini Primary is not configured for %s; using Gemini Backup.",
+                feature_name,
+            )
+        try:
+            backup_text = _invoke_gemini_text_provider(
+                backup_llm, formatted_prompt, "Gemini Backup"
+            )
+        except Exception as error:
+            backup_error = error
+            if not is_provider_fallback_eligible(error):
+                raise
+        else:
+            _record_text_provider("Gemini Backup", feature_name)
+            return backup_text
 
     if groq_client is None:
-        _log_runtime_error("Gemini language-model request", gemini_error)
-        raise TextGenerationProviderError("No backup text provider is configured.") from gemini_error
+        _log_runtime_error("Gemini text provider", backup_error or primary_error)
+        raise TextGenerationProviderError("No fallback text provider is configured.") from (
+            backup_error or primary_error
+        )
 
-    logger.warning(
-        "Gemini primary was unavailable for %s; using Groq fallback. %s",
-        feature_name,
-        _safe_error_detail(gemini_error),
-    )
+    if backup_error is not None:
+        logger.warning(
+            "Gemini Backup was unavailable for %s; using Groq Fallback. %s",
+            feature_name,
+            _safe_error_detail(backup_error),
+        )
+    elif primary_was_attempted and is_provider_fallback_eligible(primary_error):
+        logger.warning(
+            "Gemini Primary was unavailable for %s; Gemini Backup is not configured, using Groq Fallback. %s",
+            feature_name,
+            _safe_error_detail(primary_error),
+        )
+    else:
+        logger.warning("Gemini text provider is not configured for %s; using Groq Fallback.", feature_name)
+
     try:
         groq_text = _groq_text_completion(formatted_prompt, max_completion_tokens)
     except Exception as groq_error:
         _log_runtime_error("Groq fallback request", groq_error)
-        if gemini_was_attempted and is_provider_fallback_eligible(groq_error):
+        if is_provider_fallback_eligible(groq_error):
             raise BothAIProvidersUnavailableError(
-                "Gemini and Groq temporary provider requests both failed."
+                "Gemini and Groq text provider requests are temporarily unavailable."
             ) from groq_error
         raise TextGenerationProviderError("Groq fallback could not complete the text request.") from groq_error
 
-    # As above, keep local formatting/parsing faults out of provider fallback handling.
+    # Keep local formatting/parsing faults outside provider fallback handling.
     text = extract_llm_text(groq_text)
-    _record_text_provider("Groq fallback", feature_name)
+    _record_text_provider("Groq Fallback", feature_name)
     return text
 
 
@@ -873,6 +982,11 @@ def _voice_error_message(error):
         return BOTH_AI_PROVIDERS_UNAVAILABLE_MESSAGE
     if is_rate_limited_error(error):
         return VOICE_QUOTA_MESSAGE
+    if isinstance(error, GeminiNativeProvidersUnavailableError):
+        return (
+            "Gemini Primary and Gemini Backup are temporarily unavailable. "
+            "Please retry later or type your question."
+        )
     if isinstance(error, EmptyVoiceAudioError):
         return "No usable recording was captured. Please record your question again."
     if isinstance(error, UnsupportedVoiceAudioError):
@@ -882,7 +996,7 @@ def _voice_error_message(error):
     if "ffmpeg" in error_text:
         return "Audio conversion failed. Please record again or try a supported audio format."
     if "invalid_argument" in error_text or "400" in error_text:
-        return "Gemini could not accept the audio/request format. Please record again and retry."
+        return "The recorded audio could not be accepted by the transcription provider. Please record again and retry."
     if "not configured" in error_text or "api key" in error_text:
         return "Gemini is unavailable right now. Please retry later or use a text question."
     return "The voice recording could not be processed. Please retry or type your question."
@@ -901,7 +1015,7 @@ def _rag_chat_error_message(error):
 
 
 def create_gemini_llm():
-    """Use one bounded Gemini configuration for every text-generation feature."""
+    """Create the bounded Gemini Primary text client used by existing callers."""
     if not api_key:
         return None
     return ChatGoogleGenerativeAI(
@@ -909,6 +1023,18 @@ def create_gemini_llm():
         google_api_key=api_key,
         # The wrapper below owns the user-visible retry. Disable the SDK's much
         # longer implicit retry loop so quota errors do not leave the demo busy.
+        retries=0,
+        request_timeout=25,
+    )
+
+
+def create_backup_gemini_llm():
+    """Create Gemini Backup only when its independently configured key is present."""
+    if not gemini_backup_api_key:
+        return None
+    return ChatGoogleGenerativeAI(
+        model="gemini-3.6-flash",
+        google_api_key=gemini_backup_api_key,
         retries=0,
         request_timeout=25,
     )
@@ -1029,8 +1155,17 @@ def _stage_status(stage, completed_when=False):
 
 
 def _header_gemini_label():
-    """Return a truthful, non-sensitive Gemini availability label for the header."""
-    return "Gemini Configured" if api_key and client is not None else "Gemini Unavailable"
+    """Return the truthful, non-sensitive Gemini Primary configuration label."""
+    return "Gemini Primary Configured" if api_key and client is not None else "Gemini Primary Unavailable"
+
+
+def _header_gemini_backup_label():
+    """Return the truthful, non-sensitive Gemini Backup configuration label."""
+    return (
+        "Gemini Backup Configured"
+        if gemini_backup_api_key and backup_client is not None
+        else "Gemini Backup Unavailable"
+    )
 
 
 def _header_groq_label():
@@ -1040,7 +1175,14 @@ def _header_groq_label():
 
 def _text_generation_model_label():
     """Keep workspace chrome accurate when a response can come from the backup provider."""
-    return "Gemini primary · Groq fallback" if groq_client is not None else "Gemini primary"
+    providers = []
+    if client is not None:
+        providers.append("Gemini Primary")
+    if backup_client is not None:
+        providers.append("Gemini Backup")
+    if groq_client is not None:
+        providers.append("Groq Fallback")
+    return " · ".join(providers) if providers else "No text provider configured"
 
 
 def _header_rag_label():
@@ -1148,9 +1290,10 @@ def submit_topbar_search():
 
 def render_topbar():
     gemini_label = _header_gemini_label()
+    gemini_backup_label = _header_gemini_backup_label()
     rag_label = _header_rag_label()
     workflow_label = _workflow_status_label()
-    gemini_dot_class = "" if gemini_label == "Gemini Configured" else " warning"
+    gemini_dot_class = "" if gemini_label == "Gemini Primary Configured" else " warning"
     rag_dot_class = "" if rag_label == "RAG Ready" else " warning"
 
     with st.container(key="topbar_shell"):
@@ -1191,8 +1334,9 @@ def render_topbar():
             ):
                 st.markdown("#### System status")
                 st.caption("Live state for this browser session")
-                st.markdown(f"**Gemini:** {_safe_html(gemini_label.replace('Gemini ', ''))}")
-                st.markdown(f"**Backup text provider:** {_safe_html(_header_groq_label().replace('Groq Fallback ', ''))}")
+                st.markdown(f"**Gemini Primary:** {_safe_html(gemini_label.replace('Gemini Primary ', ''))}")
+                st.markdown(f"**Gemini Backup:** {_safe_html(gemini_backup_label.replace('Gemini Backup ', ''))}")
+                st.markdown(f"**Groq Fallback:** {_safe_html(_header_groq_label().replace('Groq Fallback ', ''))}")
                 st.markdown(f"**RAG:** {_safe_html(rag_label.replace('RAG ', ''))}")
                 st.markdown(f"**Indexed learning materials:** {len(st.session_state.get('processed_files', []))}")
                 st.markdown(f"**Workflow:** {_safe_html(workflow_label)}")
@@ -1208,7 +1352,8 @@ def render_topbar():
                 st.markdown(f"**Role:** {_safe_html(_current_profile_role())}")
                 st.markdown(
                     "**System status:** "
-                    f"Gemini {_safe_html(gemini_label.replace('Gemini ', ''))} · "
+                    f"Gemini Primary {_safe_html(gemini_label.replace('Gemini Primary ', ''))} · "
+                    f"Gemini Backup {_safe_html(gemini_backup_label.replace('Gemini Backup ', ''))} · "
                     f"RAG {_safe_html(rag_label.replace('RAG ', ''))} · "
                     f"{_safe_html(workflow_label)}"
                 )
@@ -1223,8 +1368,10 @@ def render_sidebar():
     rag_ready = vector_store_ready()
     status_dot_class = "" if rag_ready else " warning"
     gemini_label = _header_gemini_label()
+    gemini_backup_label = _header_gemini_backup_label()
     groq_label = _header_groq_label()
-    gemini_dot_class = "" if gemini_label == "Gemini Configured" else " warning"
+    gemini_dot_class = "" if gemini_label == "Gemini Primary Configured" else " warning"
+    gemini_backup_dot_class = "" if gemini_backup_label == "Gemini Backup Configured" else " warning"
     groq_dot_class = "" if groq_client is not None else " warning"
     chroma_label = "ChromaDB Ready" if rag_ready else "ChromaDB Unavailable"
     pipeline_label = "RAG Pipeline Active" if rag_ready else "RAG Pipeline Unavailable"
@@ -1285,6 +1432,7 @@ def render_sidebar():
             """
             + f"""
               <div class="status-row"><span class="status-dot{gemini_dot_class}"></span>{_safe_html(gemini_label)}</div>
+              <div class="status-row"><span class="status-dot{gemini_backup_dot_class}"></span>{_safe_html(gemini_backup_label)}</div>
               <div class="status-row"><span class="status-dot{groq_dot_class}"></span>{_safe_html(groq_label)}</div>
               <div class="status-row"><span class="status-dot{status_dot_class}"></span>{_safe_html(chroma_label)}</div>
               <div class="status-row"><span class="status-dot{status_dot_class}"></span>{_safe_html(pipeline_label)}</div>
@@ -1668,7 +1816,12 @@ Potential Assessment Angle:
 Do not guess unreadable labels or add facts not visible in the image.
 """
         part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-        response = client.models.generate_content(model='gemini-3.6-flash', contents=[part, prompt])
+        response = _run_gemini_native_with_backup(
+            lambda active_client: active_client.models.generate_content(
+                model='gemini-3.6-flash', contents=[part, prompt]
+            ),
+            "Gemini Vision analysis",
+        )
         result = getattr(response, 'text', '') or ''
         return '' if 'NO_EDUCATIONAL_VISUAL' in result else result.strip()
     except Exception:
@@ -1733,8 +1886,8 @@ Do not expose hidden reasoning or invent content outside the supplied context.
             max_completion_tokens=2048,
         )
     except Exception as error:
-        # Audio capture/transcription remains Gemini-only. This wrapper is only
-        # for the text answer that follows a successful transcript.
+        # This wrapper is only for the existing text answer after a successful
+        # Gemini Primary-to-Backup transcript.
         raise VoiceTutorTextAnswerError("Voice Tutor text response failed.") from error
     return transcript, response
 
@@ -1744,7 +1897,7 @@ def render_voice_tutor(learning_context):
     st.markdown("<div id='voice-tutor'></div>", unsafe_allow_html=True)
     st.markdown("### Voice Tutor")
     st.caption(
-        "Ask by voice. Gemini transcribes, then the text tutor uses Gemini primary with a Groq fallback from the certified study context."
+        "Ask by voice. Gemini Primary transcribes first, then Gemini Backup is used only if Primary is temporarily unavailable. The text tutor uses the existing Gemini-primary / Gemini-backup / Groq-fallback flow from the certified study context."
     )
     voice_question_audio = st.audio_input(
         "Ask the tutor a question",
@@ -1971,8 +2124,20 @@ def extract_media_chunks(media_file_bytes, file_extension):
         target_file = temp_optimized if file_extension in ['mp4', 'mov', 'avi'] else temp_raw
         if file_extension in ['mp4', 'mov', 'avi']: optimize_video_file(temp_raw, temp_optimized)
             
-        media_ref = client.files.upload(file=target_file)
-        transcript_text = safe_generate_content(media_ref, "Thoroughly transcribe this lecture into clean study notes.")
+        def transcribe_for_client(active_client):
+            # Gemini Files references are project-bound, so the backup attempt
+            # uploads the same local media file with its own client before use.
+            media_ref = active_client.files.upload(file=target_file)
+            response = active_client.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=[media_ref, "Thoroughly transcribe this lecture into clean study notes."],
+            )
+            return str(getattr(response, "text", "") or "")
+
+        transcript_text = _run_gemini_native_with_backup(
+            transcribe_for_client,
+            "audio/video transcription",
+        )
         for f in [temp_raw, temp_optimized]: 
             if os.path.exists(f): os.remove(f)
         return RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(transcript_text)
@@ -3618,13 +3783,18 @@ elif nav_page == "🔐 Environment & Security":
         "Configuration checks without exposing secret API keys."
     )
 
-    if api_key:
-        st.success("✅ GEMINI_API_KEY is configured in the environment.")
+    if api_key and client is not None:
+        st.success("✅ Gemini Primary is configured in the environment.")
     else:
         st.error(
-            "❌ GEMINI_API_KEY is missing. Add it to your local .env file "
+            "❌ Gemini Primary is missing. Add GEMINI_API_KEY to your local .env file "
             "or deployment secret manager."
         )
+
+    if gemini_backup_api_key and backup_client is not None:
+        st.success("✅ Gemini Backup is configured in the environment.")
+    else:
+        st.info("Gemini Backup is not configured. Gemini Primary and Groq fallback remain available when configured.")
 
     if groq_client is not None:
         st.success("✅ GROQ_API_KEY fallback is configured in the environment.")
@@ -3657,11 +3827,12 @@ else:
 # --- SYSTEM FOOTER ---
 st.markdown("---")
 footer_rag_label = "ChromaDB active" if vector_store_ready() else "ChromaDB unavailable"
-footer_gemini_label = "Gemini configured" if api_key else "Gemini not configured"
+footer_gemini_label = "Gemini Primary configured" if client is not None else "Gemini Primary unavailable"
+footer_gemini_backup_label = "Gemini Backup configured" if backup_client is not None else "Gemini Backup unavailable"
 footer_groq_label = "Groq fallback ready" if groq_client is not None else "Groq fallback unavailable"
 st.markdown(f"""
     <div class="footer-bar">
         <div><b>StudyMate AI Pro V2</b> — Autonomous Multi-Agent Learning System</div>
-        <div>System online &nbsp;•&nbsp; {_safe_html(footer_gemini_label)} &nbsp;•&nbsp; {_safe_html(footer_groq_label)} &nbsp;•&nbsp; {_safe_html(footer_rag_label)} &nbsp;•&nbsp; 4 agent roles</div>
+        <div>System online &nbsp;•&nbsp; {_safe_html(footer_gemini_label)} &nbsp;•&nbsp; {_safe_html(footer_gemini_backup_label)} &nbsp;•&nbsp; {_safe_html(footer_groq_label)} &nbsp;•&nbsp; {_safe_html(footer_rag_label)} &nbsp;•&nbsp; 4 agent roles</div>
     </div>
 """, unsafe_allow_html=True)
