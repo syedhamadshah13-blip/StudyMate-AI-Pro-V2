@@ -10,3 +10,4 @@ moviepy
 python-dotenv
 python-docx
 python-pptx
+groq
