@@ -12,6 +12,7 @@ import re
 import textwrap
 import tempfile
 import zipfile
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -387,25 +388,54 @@ def extract_llm_text(content):
     return str(content)
 
 @st.cache_resource
-def get_vector_store():
+def get_embeddings():
+    """Share only the stateless embedding model, never a user's vector collection."""
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    return Chroma(embedding_function=embeddings)
+    return embeddings
 
-if "vector_store" not in st.session_state:
+
+def _new_rag_collection_name():
+    """Return a valid, non-sensitive collection name unique to one browser session."""
+    return f"studymate-{uuid.uuid4().hex}"
+
+
+def create_session_vector_store(collection_name):
+    """Create a Chroma collection scoped to one Streamlit session only."""
+    return Chroma(
+        collection_name=collection_name,
+        embedding_function=get_embeddings(),
+    )
+
+
+def initialize_session_vector_store():
+    """Initialize an isolated collection without touching another user's data."""
+    if "rag_session_id" not in st.session_state:
+        st.session_state.rag_session_id = uuid.uuid4().hex
+    if "rag_collection_name" not in st.session_state:
+        st.session_state.rag_collection_name = _new_rag_collection_name()
+
     try:
-        st.session_state.vector_store = get_vector_store()
+        st.session_state.vector_store = create_session_vector_store(
+            st.session_state.rag_collection_name
+        )
         st.session_state.vector_store_error = None
     except Exception as error:
         # Keep the application usable when a local embedding/Chroma dependency is
         # unavailable. Avoid logging raw startup details here because the safe
         # error formatter is defined later in the module.
-        logger.error("Vector store initialization failed: %s", type(error).__name__)
+        logger.error("Session vector store initialization failed: %s", type(error).__name__)
         st.session_state.vector_store = None
         st.session_state.vector_store_error = "Vector store unavailable"
+
+if "vector_store" not in st.session_state or "rag_collection_name" not in st.session_state:
+    initialize_session_vector_store()
 elif "vector_store_error" not in st.session_state:
     st.session_state.vector_store_error = None
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = set()
+if "active_source_names" not in st.session_state:
+    # Keep the existing processed-files state as the single active-document set.
+    st.session_state.active_source_names = st.session_state.processed_files
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "api_key_revealed" not in st.session_state:
@@ -1245,6 +1275,37 @@ def normalize_grounded_rag_answer(answer_text, context):
         for match in re.findall(r"\[Source:\s*([^\]]+)\]", str(context or ""), flags=re.I)
         if match.strip()
     }
+    if not retrieved_sources:
+        raise TextGenerationProviderError(
+            "The grounded response did not receive any current-request source labels."
+        )
+
+    # Retain only exact source labels supplied by this retrieval request. A model
+    # may carry an old citation into a new answer; it must never reach the UI.
+    current_source_lookup = {
+        source.casefold(): source for source in retrieved_sources
+    }
+    removed_stale_citation = False
+
+    def keep_current_source(match):
+        nonlocal removed_stale_citation
+        source_name = match.group(1).strip()
+        current_source = current_source_lookup.get(source_name.casefold())
+        if current_source is None:
+            removed_stale_citation = True
+            return ""
+        return f"[Source: {current_source}]"
+
+    answer_text = re.sub(
+        r"\[Source:\s*([^\]]+)\]",
+        keep_current_source,
+        answer_text,
+        flags=re.I,
+    )
+    if removed_stale_citation:
+        logger.warning(
+            "Removed a citation that was not present in the current RAG retrieval."
+        )
     cited_sources = {
         match.strip()
         for match in re.findall(r"\[Source:\s*([^\]]+)\]", answer_text, flags=re.I)
@@ -1267,9 +1328,9 @@ def normalize_grounded_rag_answer(answer_text, context):
             f"[Source: {source}]" for source in sorted(retrieved_sources)
         )
         return f"{answer_text}\n\n**Retrieved sources:** {source_references}"
-    if retrieved_sources and not (cited_sources & retrieved_sources):
+    if not cited_sources.issubset(retrieved_sources):
         raise TextGenerationProviderError(
-            "The grounded response did not cite one of the retrieved study sources."
+            "The grounded response included a source outside the current retrieval."
         )
     return answer_text
 
@@ -2009,35 +2070,95 @@ def extract_document_chunks(file_bytes, extension):
     ).split_text(text_value)
 
 
+def _active_source_names():
+    """Return only the current session's intentionally active source labels."""
+    sources = st.session_state.get("active_source_names")
+    if sources is None:
+        sources = st.session_state.get("processed_files", set())
+    return {str(source) for source in sources if str(source).strip()}
+
+
+def _current_session_metadata_filter():
+    """Limit Chroma queries to chunks tagged for the active Streamlit session."""
+    session_id = str(st.session_state.get("rag_session_id", "")).strip()
+    if not session_id:
+        # An impossible session marker is safer than an unfiltered Chroma query.
+        return {"rag_session_id": "__missing_studymate_session__"}
+    return {"rag_session_id": session_id}
+
+
+def _is_current_active_document(doc):
+    """Apply a second, in-process guard against stale or foreign Chroma chunks."""
+    metadata = getattr(doc, "metadata", {}) or {}
+    return (
+        metadata.get("rag_session_id") == st.session_state.get("rag_session_id")
+        and metadata.get("source") in _active_source_names()
+    )
+
+
+def _filter_current_active_documents(docs):
+    """Reject results that do not belong to this session's current document set."""
+    return [doc for doc in (docs or []) if _is_current_active_document(doc)]
+
+
 def refresh_retriever(k=3):
-    """Refresh the session retriever after new chunks reach the active vector store."""
+    """Refresh a retriever that is constrained to the active session collection."""
     try:
         vector_store = st.session_state.get("vector_store")
         if vector_store is None:
             raise RuntimeError("The local vector store is unavailable.")
+        if not _active_source_names():
+            st.session_state.pop("retriever", None)
+            st.session_state.pop("retriever_k", None)
+            return False
         st.session_state.retriever = vector_store.as_retriever(
-            search_kwargs={"k": k}
+            search_kwargs={"k": k, "filter": _current_session_metadata_filter()}
         )
+        st.session_state.retriever_k = k
         return True
     except Exception as error:
         _log_runtime_error("ChromaDB retriever initialization", error)
         st.session_state.pop("retriever", None)
+        st.session_state.pop("retriever_k", None)
         return False
 
 
-def retrieve_agent_context(query, k=5, *, raise_on_error=False):
-    """Retrieve grounded context and source metadata from the existing ChromaDB."""
-    docs = []
+def retrieve_current_session_documents(query, k=3, *, raise_on_error=False):
+    """Retrieve only chunks from this session's active document set."""
+    if not _active_source_names():
+        return []
+
     try:
         vector_store = st.session_state.get("vector_store")
         if vector_store is None:
             raise RuntimeError("The local vector store is unavailable.")
-        docs = vector_store.similarity_search(query, k=k)
+
+        if (
+            st.session_state.get("retriever") is not None
+            and st.session_state.get("retriever_k") == k
+        ):
+            docs = st.session_state.retriever.invoke(query)
+        else:
+            docs = vector_store.similarity_search(
+                query,
+                k=k,
+                filter=_current_session_metadata_filter(),
+            )
+        return _filter_current_active_documents(docs)
     except Exception as error:
         _log_runtime_error("ChromaDB retrieval", error)
         if raise_on_error:
             raise RuntimeError("ChromaDB retrieval failed.") from error
-        docs = []
+        return []
+
+
+def retrieve_agent_context(query, k=5, *, raise_on_error=False):
+    """Retrieve grounded context only from the active session's source set."""
+    docs = retrieve_current_session_documents(
+        query,
+        k=k,
+        raise_on_error=raise_on_error,
+    )
 
     context_parts = []
     sources = []
@@ -2064,6 +2185,47 @@ def retrieve_agent_context(query, k=5, *, raise_on_error=False):
     return fallback, [], []
 
 
+def clear_current_session_rag():
+    """Delete only this session's collection and clear material-bound state."""
+    current_store = st.session_state.get("vector_store")
+    if current_store is not None:
+        try:
+            # This handle was created with this session's UUID collection name.
+            # Never use a global Chroma reset or delete another session's data.
+            current_store.delete_collection()
+        except Exception as error:
+            # A failed cleanup leaves an orphaned, unreachable UUID collection;
+            # the fresh collection below still prevents stale retrieval.
+            _log_runtime_error("Current session ChromaDB cleanup", error)
+
+    active_sources = set()
+    st.session_state.processed_files = active_sources
+    st.session_state.active_source_names = active_sources
+    st.session_state.messages = []
+    st.session_state.agent_retrieved_sources = []
+    st.session_state.vision_insights = []
+    st.session_state.pending_query = None
+    st.session_state.last_exam_output = None
+    st.session_state.last_exam_is_paper = False
+    st.session_state.last_text_provider = None
+    st.session_state.voice_tutor_output = None
+    st.session_state.voice_audio_bytes = None
+    st.session_state.voice_audio_mime = None
+    st.session_state.voice_audio_name = None
+    st.session_state.voice_transcript = None
+    st.session_state.voice_question = None
+    st.session_state.show_upload_dialog = False
+    st.session_state.pop("modal_file_uploader_widget", None)
+    st.session_state.pop("retriever", None)
+    st.session_state.pop("retriever_k", None)
+
+    # A fresh UUID means an old handle cannot become active again after reset.
+    st.session_state.rag_session_id = uuid.uuid4().hex
+    st.session_state.rag_collection_name = _new_rag_collection_name()
+    st.session_state.vector_store = None
+    initialize_session_vector_store()
+
+
 def examiner_precheck(exam_text):
     """Fast Python structure check before the QA Critic receives the exam."""
     issues = []
@@ -2082,7 +2244,10 @@ def examiner_precheck(exam_text):
     return issues
 
 
-def reset_agent_workflow():
+def reset_agent_workflow(clear_session_materials=False):
+    """Reset agent artifacts, optionally starting a new isolated material session."""
+    if clear_session_materials:
+        clear_current_session_rag()
     st.session_state.agent_architect_output = None
     st.session_state.agent_examiner_output = None
     st.session_state.agent_qa_output = None
@@ -2200,7 +2365,11 @@ def upload_study_files_modal():
                             chunks = extract_document_chunks(file_bytes, ext) if ext in ['pdf', 'txt', 'docx', 'pptx'] else extract_media_chunks(file_bytes, ext)
                             for i in range(0, len(chunks), 15): 
                                 batch = chunks[i:i + 15]
-                                metadatas = [{"source": f.name, "content_type": "text"} for _ in batch]
+                                metadatas = [{
+                                    "source": f.name,
+                                    "content_type": "text",
+                                    "rag_session_id": st.session_state.rag_session_id,
+                                } for _ in batch]
                                 st.session_state.vector_store.add_texts(batch, metadatas=metadatas)
 
                             if enable_vision_analysis and ext in ["pdf", "pptx"]:
@@ -2212,7 +2381,8 @@ def upload_study_files_modal():
                                         metadatas=[{
                                             "source": f.name,
                                             "content_type": "vision",
-                                            "visual_source": item["visual_source"]
+                                            "visual_source": item["visual_source"],
+                                            "rag_session_id": st.session_state.rag_session_id,
                                         } for item in visual_insights]
                                     )
                                     st.session_state.vision_insights.extend(visual_insights)
@@ -2359,13 +2529,17 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                             if not transcript_text:
                                 raise EmptyVoiceTranscriptError("Gemini returned an empty lecture transcription.")
                             st.session_state.voice_transcript = transcript_text
+                            lecture_title = f"Lecture_Audio_Note_{int(time.time())}"
                             chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(transcript_text)
                             for i in range(0, len(chunks), 15):
                                 batch = chunks[i:i + 15]
-                                metadatas = [{"source": "Live Audio Lecture"} for _ in batch]
+                                metadatas = [{
+                                    "source": lecture_title,
+                                    "content_type": "lecture_audio",
+                                    "rag_session_id": st.session_state.rag_session_id,
+                                } for _ in batch]
                                 st.session_state.vector_store.add_texts(batch, metadatas=metadatas)
 
-                            lecture_title = f"Lecture_Audio_Note_{int(time.time())}"
                             st.session_state.processed_files.add(lecture_title)
                             if refresh_retriever():
                                 st.success("✅ Lecture successfully transcribed and added to your Neural Database!")
@@ -2460,7 +2634,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                 with st.spinner("🧠 Searching Neural Database..."):
                     try:
                         if _grounded_chat_ready():
-                            docs = st.session_state['retriever'].invoke(chat_query)
+                            docs = retrieve_current_session_documents(chat_query, k=3)
                             if not docs:
                                 st.info("I couldn't find enough relevant information in the indexed material for that question.")
                             else:
@@ -2503,7 +2677,7 @@ if nav_page in {HOME_ROUTE, STUDY_WORKSPACE_ROUTE}:
                     with st.spinner("🧠 Searching Neural Database..."):
                         try:
                             if _grounded_chat_ready():
-                                docs = st.session_state['retriever'].invoke(user_text)
+                                docs = retrieve_current_session_documents(user_text, k=3)
                                 if not docs:
                                     st.info("I couldn't find enough relevant information in the indexed material for that question.")
                                 else:
@@ -2656,7 +2830,10 @@ elif nav_page == "📝 AI Exam Generator":
                 try:
                     if "retriever" not in st.session_state and not refresh_retriever():
                         raise RuntimeError("The retriever could not be initialized.")
-                    docs = st.session_state.retriever.invoke("Summarize key concepts for a grounded exam")
+                    docs = retrieve_current_session_documents(
+                        "Summarize key concepts for a grounded exam",
+                        k=3,
+                    )
                     if not docs:
                         st.warning("No relevant indexed material was retrieved. Add or re-index notes before generating an exam.")
                     else:
@@ -2788,7 +2965,7 @@ elif nav_page == "🤖 Auto-Agent Workflow":
                     use_container_width=True,
                     key="reset_agent_workflow"
                 ):
-                    reset_agent_workflow()
+                    reset_agent_workflow(clear_session_materials=True)
                     st.session_state.workflow_reset_widget_values = True
                     st.rerun()
     with workflow_sources_col:
